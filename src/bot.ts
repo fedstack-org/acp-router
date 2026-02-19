@@ -40,6 +40,7 @@ async function saveCachedSessionId(chatId: number, cwd: string, sessionId: strin
 const TYPING_INTERVAL_MS = 4000
 const MODEL_PAGE_SIZE = 8
 const MODEL_COLS = 2
+const SESSION_PAGE_SIZE = 10
 
 const BUILTIN_COMMANDS = [
   { command: 'start', description: 'Start a new Droid session' },
@@ -64,12 +65,24 @@ class RouterClient implements acp.Client {
   streamBuf: StreamBuffer | null = null
   toolMsgs = new Map<string, number>()
   pendingPerms = new Map<string, (r: acp.RequestPermissionResponse) => void>()
+  cachedSessions: acp.SessionInfo[] = []
+  cachedSessionsCursor: string | null = null
   busy = false
 
   constructor(
     private chatId: number,
     private ctx: Context
   ) {}
+
+  startTyping() {
+    const tick = () => this.ctx.api.sendChatAction(this.chatId, 'typing').catch(() => {})
+    tick()
+    this.typingInterval = setInterval(tick, TYPING_INTERVAL_MS)
+  }
+
+  stopTyping() {
+    this.clearTyping()
+  }
 
   async requestPermission(params: acp.RequestPermissionRequest): Promise<acp.RequestPermissionResponse> {
     await this.flushBuffers()
@@ -255,13 +268,18 @@ export function createBot(config: Config) {
       c = (await initChat(ctx.chat.id, ctx, config, chats)) ?? undefined
       if (!c) return
     }
+    c.startTyping()
     try {
       const res = await c.conn.unstable_listSessions({})
       if (!res.sessions.length) return void (await ctx.reply('No sessions found.'))
-      const { text, kb } = formatSessionsPage(res.sessions, c.sessionId, res.nextCursor ?? null)
+      c.cachedSessions = res.sessions
+      c.cachedSessionsCursor = res.nextCursor ?? null
+      const { text, kb } = formatSessionsPage(c.cachedSessions, 0, c.sessionId, c.cachedSessionsCursor)
       await ctx.reply(text, { parse_mode: 'HTML', reply_markup: kb })
     } catch (err) {
       await ctx.reply(`Failed to list sessions: ${esc(err instanceof Error ? err.message : String(err))}`, { parse_mode: 'HTML' })
+    } finally {
+      c.stopTyping()
     }
   })
 
@@ -374,18 +392,27 @@ export function createBot(config: Config) {
       await ctx.answerCallbackQuery()
       await ctx.editMessageReplyMarkup({ reply_markup: modelPageKb(c.models, page) })
     } else if (prefix === 'sessionspage') {
-      const cursor = ctx.callbackQuery.data.slice('sessionspage:'.length)
-      try {
-        const res = await c.conn.unstable_listSessions({ cursor })
-        if (!res.sessions.length) {
-          await ctx.answerCallbackQuery({ text: 'No more sessions.' })
-          return
+      const suffix = ctx.callbackQuery.data.slice('sessionspage:'.length)
+      if (suffix === '_noop') return void (await ctx.answerCallbackQuery())
+      if (suffix === '_more') {
+        if (!c.cachedSessionsCursor) return void (await ctx.answerCallbackQuery({ text: 'No more sessions.' }))
+        try {
+          const res = await c.conn.unstable_listSessions({ cursor: c.cachedSessionsCursor })
+          c.cachedSessions = c.cachedSessions.concat(res.sessions)
+          c.cachedSessionsCursor = res.nextCursor ?? null
+          const page = Math.floor((c.cachedSessions.length - res.sessions.length) / SESSION_PAGE_SIZE)
+          const { text, kb } = formatSessionsPage(c.cachedSessions, page, c.sessionId, c.cachedSessionsCursor)
+          await ctx.answerCallbackQuery()
+          await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: kb })
+        } catch (err) {
+          await ctx.answerCallbackQuery({ text: `Error: ${err instanceof Error ? err.message : err}` })
         }
-        const { text, kb } = formatSessionsPage(res.sessions, c.sessionId, res.nextCursor ?? null)
+      } else {
+        const page = parseInt(suffix, 10)
+        if (!c.cachedSessions.length) return void (await ctx.answerCallbackQuery({ text: 'No cached sessions.' }))
+        const { text, kb } = formatSessionsPage(c.cachedSessions, page, c.sessionId, c.cachedSessionsCursor)
         await ctx.answerCallbackQuery()
         await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: kb })
-      } catch (err) {
-        await ctx.answerCallbackQuery({ text: `Error: ${err instanceof Error ? err.message : err}` })
       }
     } else if (prefix === 'cfg') {
       try {
@@ -450,18 +477,15 @@ async function doPrompt(ctx: Context, c: RouterClient, text: string) {
   if (c.busy) return void (await ctx.reply('Still processing. Please wait.'))
   c.busy = true
   c.streamBuf = new StreamBuffer(ctx)
-  const chatId = ctx.chat!.id
-  const tick = () => ctx.api.sendChatAction(chatId, 'typing').catch(() => {})
-  tick()
-  c.typingInterval = setInterval(tick, TYPING_INTERVAL_MS)
+  c.startTyping()
 
   try {
     const r = await c.conn.prompt({ sessionId: c.sessionId, prompt: [{ type: 'text', text }] })
-    c.clearTyping()
+    c.stopTyping()
     await c.flushBuffers()
     if (r.stopReason !== 'end_turn') await ctx.reply(`Turn ended: ${r.stopReason}`)
   } catch (err) {
-    c.clearTyping()
+    c.stopTyping()
     await ctx.reply(`Error: ${esc(err instanceof Error ? err.message : String(err))}`, { parse_mode: 'HTML' })
   } finally {
     c.streamBuf = null
@@ -617,16 +641,24 @@ function flatOpts(opt: acp.SessionConfigOption): acp.SessionConfigSelectOption[]
   return opt.options as acp.SessionConfigSelectOption[]
 }
 
-function formatSessionsPage(sessions: acp.SessionInfo[], currentSessionId: string, nextCursor: string | null): { text: string; kb: InlineKeyboard } {
-  const lines = ['<b>Sessions</b>']
-  for (const s of sessions) {
+function formatSessionsPage(allSessions: acp.SessionInfo[], page: number, currentSessionId: string, serverCursor: string | null): { text: string; kb: InlineKeyboard } {
+  const pages = Math.ceil(allSessions.length / SESSION_PAGE_SIZE)
+  const start = page * SESSION_PAGE_SIZE
+  const slice = allSessions.slice(start, start + SESSION_PAGE_SIZE)
+  const lines = [`<b>Sessions</b> (${allSessions.length} total)`]
+  for (const s of slice) {
     const current = s.sessionId === currentSessionId ? ' \u2713' : ''
     const title = s.title ? ` \u2014 ${esc(s.title)}` : ''
     const updated = s.updatedAt ? `\n    Updated: ${esc(s.updatedAt)}` : ''
     lines.push(`  \u2022 <code>${esc(s.sessionId)}</code>${current}${title}\n    CWD: <code>${esc(s.cwd)}</code>${updated}`)
   }
   const kb = new InlineKeyboard()
-  if (nextCursor) kb.text('Next \u25B6', `sessionspage:${nextCursor}`)
+  if (pages > 1 || serverCursor) {
+    if (page > 0) kb.text('\u25C0 Prev', `sessionspage:${page - 1}`)
+    kb.text(`${page + 1}/${pages}`, 'sessionspage:_noop')
+    if (page < pages - 1) kb.text('Next \u25B6', `sessionspage:${page + 1}`)
+    else if (serverCursor) kb.text('More \u25B6', 'sessionspage:_more')
+  }
   return { text: lines.join('\n'), kb }
 }
 
