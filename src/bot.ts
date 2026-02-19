@@ -20,9 +20,18 @@ interface ChatState {
   busy: boolean;
 }
 
+const BUILTIN_COMMANDS = [
+  { command: "start", description: "Start a new Droid session" },
+  { command: "cancel", description: "Cancel current operation" },
+  { command: "help", description: "Show available commands" },
+];
+
 export function createBot(config: Config) {
   const bot = new Bot(config.telegramBotToken);
   const chats = new Map<number, ChatState>();
+
+  // Register base commands on startup
+  bot.api.setMyCommands(BUILTIN_COMMANDS).catch(() => {});
 
   // Whitelist middleware
   bot.use(async (ctx, next) => {
@@ -53,6 +62,43 @@ export function createBot(config: Config) {
     }
     state.session.cancel();
     await ctx.reply("Cancellation requested.");
+  });
+
+  // /help -- list all commands
+  bot.command("help", async (ctx) => {
+    const chatId = ctx.chat.id;
+    const state = chats.get(chatId);
+
+    let text = "<b>Built-in commands:</b>\n";
+    for (const c of BUILTIN_COMMANDS) {
+      text += `/${c.command} — ${escapeHtml(c.description)}\n`;
+    }
+
+    if (state) {
+      const acpCmds = state.session.availableCommands;
+      if (acpCmds.length > 0) {
+        text += "\n<b>Agent commands:</b>\n";
+        for (const c of acpCmds) {
+          const name = c.name.toLowerCase().replace(/[^a-z0-9_]/g, "_");
+          const hint = c.input ? ` <i>${escapeHtml(c.input.hint)}</i>` : "";
+          text += `/${name}${hint} — ${escapeHtml(c.description)}\n`;
+        }
+      }
+
+      const opts = state.session.configOptions;
+      if (opts.length > 0) {
+        text += "\n<b>Config options:</b>\n";
+        for (const o of opts) {
+          const name = `set_${o.id.toLowerCase().replace(/[^a-z0-9_]/g, "_")}`;
+          const current = o.options.find((v) => v.value === o.currentValue)?.name ?? o.currentValue;
+          text += `/${name} — ${escapeHtml(o.name)} [${escapeHtml(current)}]\n`;
+        }
+      }
+    } else {
+      text += "\nNo active session. Send /start or any message to begin.";
+    }
+
+    await ctx.reply(text, { parse_mode: "HTML" });
   });
 
   // Callback queries for permissions and config options
@@ -106,7 +152,7 @@ export function createBot(config: Config) {
       const cmdArgs = spaceIdx === -1 ? "" : text.slice(spaceIdx + 1);
 
       // Skip built-in commands we handle ourselves
-      if (["start", "cancel"].includes(cmdName)) return;
+      if (["start", "cancel", "help"].includes(cmdName)) return;
 
       // Check if this is a known ACP command
       const acpCmd = state.session.availableCommands.find(
@@ -354,8 +400,7 @@ async function registerTelegramCommands(
   configOptions: ReadonlyArray<ConfigOption>,
 ) {
   const commands: Array<{ command: string; description: string }> = [
-    { command: "start", description: "Start a new Droid session" },
-    { command: "cancel", description: "Cancel current operation" },
+    ...BUILTIN_COMMANDS,
   ];
 
   for (const cmd of acpCommands) {
