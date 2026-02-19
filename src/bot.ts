@@ -440,42 +440,54 @@ export function createBot(config: Config) {
     const chatId = ctx.chat.id
     let c = chats.get(chatId)
 
-    if (c && c.conn.signal.aborted) {
-      c.destroy()
-      chats.delete(chatId)
-      c = undefined
+    // Start typing immediately on receiving any text message
+    const tick = () => ctx.api.sendChatAction(chatId, 'typing').catch(() => {})
+    tick()
+    let earlyTyping: ReturnType<typeof setInterval> | null = setInterval(tick, TYPING_INTERVAL_MS)
+    const clearEarlyTyping = () => {
+      if (earlyTyping) { clearInterval(earlyTyping); earlyTyping = null }
     }
 
-    if (!c) {
-      const client = await ensureAgent(chatId, ctx, config, chats)
-      if (!client) return
-      c = client
-    }
-    if (!c.hasSession) {
-      const ok = await ensureSession(c, chatId, ctx, config)
-      if (!ok) return
-    }
+    try {
+      if (c && c.conn.signal.aborted) {
+        c.destroy()
+        chats.delete(chatId)
+        c = undefined
+      }
 
-    const text = ctx.message.text
+      if (!c) {
+        const client = await ensureAgent(chatId, ctx, config, chats)
+        if (!client) return
+        c = client
+      }
+      if (!c.hasSession) {
+        const ok = await ensureSession(c, chatId, ctx, config)
+        if (!ok) return
+      }
 
-    if (text.startsWith('/set_')) {
-      const m = text.match(/^\/set_(\S+)/)
-      if (!m) return
-      const opt = c.configOptions.find((o) => tgCmd(o.id) === m[1])
-      if (!opt) return void (await ctx.reply(`Unknown config option: ${m[1]}`))
-      return void (await ctx.reply(configMsg(opt), { parse_mode: 'HTML', reply_markup: configKb(opt) }))
+      const text = ctx.message.text
+
+      if (text.startsWith('/set_')) {
+        const m = text.match(/^\/set_(\S+)/)
+        if (!m) return
+        const opt = c.configOptions.find((o) => tgCmd(o.id) === m[1])
+        if (!opt) return void (await ctx.reply(`Unknown config option: ${m[1]}`))
+        return void (await ctx.reply(configMsg(opt), { parse_mode: 'HTML', reply_markup: configKb(opt) }))
+      }
+
+      if (text.startsWith('/')) {
+        const si = text.indexOf(' ')
+        const name = (si === -1 ? text.slice(1) : text.slice(1, si)).toLowerCase()
+        if (['start', 'cancel', 'help', 'sessions', 'mode', 'model'].includes(name)) return
+        const args = si === -1 ? '' : text.slice(si + 1)
+        const cmd = c.availableCommands.find((x) => tgCmd(x.name) === name)
+        if (cmd) return void (await doPrompt(ctx, c, args ? `/${cmd.name} ${args}` : `/${cmd.name}`))
+      }
+
+      await doPrompt(ctx, c, text)
+    } finally {
+      clearEarlyTyping()
     }
-
-    if (text.startsWith('/')) {
-      const si = text.indexOf(' ')
-      const name = (si === -1 ? text.slice(1) : text.slice(1, si)).toLowerCase()
-      if (['start', 'cancel', 'help', 'sessions', 'mode', 'model'].includes(name)) return
-      const args = si === -1 ? '' : text.slice(si + 1)
-      const cmd = c.availableCommands.find((x) => tgCmd(x.name) === name)
-      if (cmd) return void (await doPrompt(ctx, c, args ? `/${cmd.name} ${args}` : `/${cmd.name}`))
-    }
-
-    await doPrompt(ctx, c, text)
   })
 
   return bot
@@ -485,15 +497,12 @@ async function doPrompt(ctx: Context, c: RouterClient, text: string) {
   if (c.busy) return void (await ctx.reply('Still processing. Please wait.'))
   c.busy = true
   c.streamBuf = new StreamBuffer(ctx)
-  c.startTyping()
 
   try {
     const r = await c.conn.prompt({ sessionId: c.sessionId, prompt: [{ type: 'text', text }] })
-    c.stopTyping()
     await c.flushBuffers()
     if (r.stopReason !== 'end_turn') await ctx.reply(`Turn ended: ${r.stopReason}`)
   } catch (err) {
-    c.stopTyping()
     await ctx.reply(`Error: ${esc(err instanceof Error ? err.message : String(err))}`, { parse_mode: 'HTML' })
   } finally {
     c.streamBuf = null
