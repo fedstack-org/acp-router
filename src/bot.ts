@@ -511,9 +511,20 @@ function sessionInfoMsg(c: RouterClient, resumed: boolean): string {
   lines.push(resumed ? '<b>Resumed session</b>' : '<b>New session</b>')
   lines.push(`Session ID: <code>${esc(c.sessionId)}</code>`)
   if (c.sessionTitle) lines.push(`Title: ${esc(c.sessionTitle)}`)
-  if (c.modes) lines.push(`Modes:\n${c.modes.availableModes.map((m) => `  \u2022 <code>${esc(m.name)}</code>`).join('\n')}`)
-  if (c.models) lines.push(`Models:\n${c.models.availableModels.map((m) => `  \u2022 <code>${esc(m.name)}</code>`).join('\n')}`)
-  if (c.configOptions.length) lines.push(`Options: ${c.configOptions.map((o) => esc(o.name)).join(', ')}`)
+  if (c.modes) {
+    const cur = c.modes.currentModeId
+    lines.push(`Modes:\n${c.modes.availableModes.map((m) => `  ${m.id === cur ? '\u2713' : '\u2022'} <code>${esc(m.name)}</code>`).join('\n')}`)
+  }
+  if (c.models) {
+    const cur = c.models.currentModelId
+    lines.push(`Models:\n${c.models.availableModels.map((m) => `  ${m.modelId === cur ? '\u2713' : '\u2022'} <code>${esc(m.name)}</code>`).join('\n')}`)
+  }
+  if (c.configOptions.length) {
+    lines.push(`Options:\n${c.configOptions.map((o) => {
+      const cur = flatOpts(o).find((v) => v.value === o.currentValue)?.name ?? o.currentValue
+      return `  \u2022 ${esc(o.name)}: <code>${esc(cur)}</code>`
+    }).join('\n')}`)
+  }
   return lines.join('\n')
 }
 
