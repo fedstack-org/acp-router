@@ -1,4 +1,4 @@
-import { Bot, InlineKeyboard, type Context } from 'grammy'
+import { Bot, InlineKeyboard, InputFile, type Context } from 'grammy'
 import * as acp from '@agentclientprotocol/sdk'
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
@@ -93,10 +93,10 @@ class RouterClient implements acp.Client {
     const u = params.update
     switch (u.sessionUpdate) {
       case 'agent_message_chunk':
-        if (u.content.type === 'text') this.streamBuf?.append(u.content.text)
+        await this.handleContentBlock(u.content)
         break
       case 'agent_thought_chunk':
-        if (u.content.type === 'text') this.streamBuf?.append(u.content.text)
+        await this.handleContentBlock(u.content)
         break
       case 'tool_call':
         await this.flushBuffers()
@@ -152,6 +152,32 @@ class RouterClient implements acp.Client {
       await this.ctx.api.setMyCommands(cmds)
     } catch {
       /* ignore */
+    }
+  }
+
+  async handleContentBlock(block: acp.ContentBlock) {
+    switch (block.type) {
+      case 'text':
+        this.streamBuf?.append(block.text)
+        break
+      case 'image': {
+        await this.flushBuffers()
+        const buf = Buffer.from(block.data, 'base64')
+        const ext = block.mimeType.split('/')[1] ?? 'bin'
+        await this.ctx.api.sendPhoto(this.chatId, new InputFile(buf, `image.${ext}`)).catch(() => {})
+        break
+      }
+      case 'audio': {
+        await this.flushBuffers()
+        const buf = Buffer.from(block.data, 'base64')
+        const ext = block.mimeType.split('/')[1] ?? 'bin'
+        await this.ctx.api.sendAudio(this.chatId, new InputFile(buf, `audio.${ext}`)).catch(() => {})
+        break
+      }
+      default:
+        await this.flushBuffers()
+        await this.ctx.api.sendMessage(this.chatId, `[Content Type: ${block.type}]`).catch(() => {})
+        break
     }
   }
 
