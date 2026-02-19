@@ -38,6 +38,8 @@ async function saveCachedSessionId(chatId: number, cwd: string, sessionId: strin
 
 const TYPING_INTERVAL_MS = 4000
 const MAX_MESSAGE_LENGTH = 4096
+const FLUSH_THRESHOLD = 3000
+const FLUSH_INTERVAL_MS = 5000
 const MODEL_PAGE_SIZE = 8
 const MODEL_COLS = 2
 
@@ -60,8 +62,8 @@ class RouterClient implements acp.Client {
   modes: acp.SessionModeState | null = null
   models: acp.SessionModelState | null = null
   typingInterval: ReturnType<typeof setInterval> | null = null
-  agentText = ''
-  thought = ''
+  thoughtBuf: StreamBuffer | null = null
+  agentBuf: StreamBuffer | null = null
   toolMsgs = new Map<string, number>()
   pendingPerms = new Map<string, (r: acp.RequestPermissionResponse) => void>()
   busy = false
@@ -93,10 +95,10 @@ class RouterClient implements acp.Client {
     const u = params.update
     switch (u.sessionUpdate) {
       case 'agent_message_chunk':
-        if (u.content.type === 'text') this.agentText += u.content.text
+        if (u.content.type === 'text') this.agentBuf?.append(u.content.text)
         break
       case 'agent_thought_chunk':
-        if (u.content.type === 'text') this.thought += u.content.text
+        if (u.content.type === 'text') this.thoughtBuf?.append(u.content.text)
         break
       case 'tool_call':
         try {
@@ -388,8 +390,8 @@ export function createBot(config: Config) {
 async function doPrompt(ctx: Context, c: RouterClient, text: string) {
   if (c.busy) return void (await ctx.reply('Still processing. Please wait.'))
   c.busy = true
-  c.agentText = ''
-  c.thought = ''
+  c.thoughtBuf = new StreamBuffer(ctx, '<b>Thinking:</b>\n')
+  c.agentBuf = new StreamBuffer(ctx)
   const chatId = ctx.chat!.id
   const tick = () => ctx.api.sendChatAction(chatId, 'typing').catch(() => {})
   tick()
@@ -398,13 +400,15 @@ async function doPrompt(ctx: Context, c: RouterClient, text: string) {
   try {
     const r = await c.conn.prompt({ sessionId: c.sessionId, prompt: [{ type: 'text', text }] })
     c.clearTyping()
-    if (c.thought.trim()) await sendSplit(ctx, `<b>Thinking:</b>\n${esc(c.thought)}`)
-    if (c.agentText.trim()) await sendSplit(ctx, c.agentText)
+    await c.thoughtBuf.flush()
+    await c.agentBuf.flush()
     if (r.stopReason !== 'end_turn') await ctx.reply(`Turn ended: ${r.stopReason}`)
   } catch (err) {
     c.clearTyping()
     await ctx.reply(`Error: ${esc(err instanceof Error ? err.message : String(err))}`, { parse_mode: 'HTML' })
   } finally {
+    c.thoughtBuf = null
+    c.agentBuf = null
     c.busy = false
   }
 }
@@ -593,16 +597,94 @@ function configMsg(opt: acp.SessionConfigOption): string {
   return `<b>${esc(opt.name)}</b>${d}\nCurrent: <code>${esc(opt.currentValue)}</code>`
 }
 
-async function sendSplit(ctx: Context, text: string) {
-  let r = text
-  while (r.length > MAX_MESSAGE_LENGTH) {
-    let at = r.lastIndexOf('\n\n', MAX_MESSAGE_LENGTH)
-    if (at < MAX_MESSAGE_LENGTH / 2) at = r.lastIndexOf('\n', MAX_MESSAGE_LENGTH)
-    if (at < MAX_MESSAGE_LENGTH / 2) at = MAX_MESSAGE_LENGTH
-    await ctx.reply(r.slice(0, at), { parse_mode: 'HTML' })
-    r = r.slice(at).trimStart()
+function hasOpenCodeBlock(text: string): boolean {
+  let open = false
+  let i = 0
+  while (i < text.length) {
+    if (text.startsWith('```', i)) {
+      open = !open
+      i += 3
+      if (open) {
+        const nl = text.indexOf('\n', i)
+        if (nl !== -1) i = nl + 1
+      }
+    } else {
+      i++
+    }
   }
-  if (r) await ctx.reply(r, { parse_mode: 'HTML' })
+  return open
+}
+
+function findSafeSplit(text: string, max: number): number {
+  if (text.length <= max) return text.length
+  const fence = text.lastIndexOf('\n```', max)
+  if (fence > max / 2 && !hasOpenCodeBlock(text.slice(0, fence))) return fence
+  const dblNl = text.lastIndexOf('\n\n', max)
+  if (dblNl > max / 2 && !hasOpenCodeBlock(text.slice(0, dblNl))) return dblNl
+  const nl = text.lastIndexOf('\n', max)
+  if (nl > max / 2 && !hasOpenCodeBlock(text.slice(0, nl))) return nl
+  const sp = text.lastIndexOf(' ', max)
+  if (sp > max / 2 && !hasOpenCodeBlock(text.slice(0, sp))) return sp
+  return max
+}
+
+class StreamBuffer {
+  buf = ''
+  timer: ReturnType<typeof setTimeout> | null = null
+
+  constructor(
+    private ctx: Context,
+    private prefix = ''
+  ) {}
+
+  append(chunk: string) {
+    this.buf += chunk
+    if (this.buf.length >= FLUSH_THRESHOLD) {
+      this.scheduleFlush(0)
+    } else if (!this.timer) {
+      this.scheduleFlush(FLUSH_INTERVAL_MS)
+    }
+  }
+
+  private scheduleFlush(ms: number) {
+    if (this.timer) clearTimeout(this.timer)
+    this.timer = setTimeout(() => {
+      this.timer = null
+      this.doFlush().catch(() => {})
+    }, ms)
+  }
+
+  private async doFlush() {
+    while (this.buf.length >= FLUSH_THRESHOLD) {
+      const at = findSafeSplit(this.buf, MAX_MESSAGE_LENGTH)
+      const chunk = this.buf.slice(0, at)
+      this.buf = this.buf.slice(at).trimStart()
+      const msg = this.prefix ? `${this.prefix}${chunk}` : chunk
+      await this.ctx.reply(msg, { parse_mode: 'HTML' }).catch(() => {})
+      this.prefix = ''
+    }
+  }
+
+  async flush() {
+    if (this.timer) {
+      clearTimeout(this.timer)
+      this.timer = null
+    }
+    while (this.buf.length > MAX_MESSAGE_LENGTH) {
+      const at = findSafeSplit(this.buf, MAX_MESSAGE_LENGTH)
+      const chunk = this.buf.slice(0, at)
+      this.buf = this.buf.slice(at).trimStart()
+      const msg = this.prefix ? `${this.prefix}${chunk}` : chunk
+      await this.ctx.reply(msg, { parse_mode: 'HTML' }).catch(() => {})
+      this.prefix = ''
+    }
+    if (this.buf.trim()) {
+      const msg = this.prefix ? `${this.prefix}${this.buf}` : this.buf
+      await this.ctx.reply(msg, { parse_mode: 'HTML' }).catch(() => {})
+    }
+    this.buf = ''
+    this.prefix = ''
+  }
 }
 
 function esc(t: string) {
