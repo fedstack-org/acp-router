@@ -40,7 +40,6 @@ async function saveCachedSessionId(chatId: number, cwd: string, sessionId: strin
 const TYPING_INTERVAL_MS = 4000
 const MODEL_PAGE_SIZE = 8
 const MODEL_COLS = 2
-const SESSION_PAGE_SIZE = 10
 
 const BUILTIN_COMMANDS = [
   { command: 'start', description: 'Start a new Droid session' },
@@ -65,7 +64,6 @@ class RouterClient implements acp.Client {
   streamBuf: StreamBuffer | null = null
   toolMsgs = new Map<string, number>()
   pendingPerms = new Map<string, (r: acp.RequestPermissionResponse) => void>()
-  cachedSessions: acp.SessionInfo[] = []
   busy = false
 
   constructor(
@@ -260,8 +258,7 @@ export function createBot(config: Config) {
     try {
       const res = await c.conn.unstable_listSessions({})
       if (!res.sessions.length) return void (await ctx.reply('No sessions found.'))
-      c.cachedSessions = res.sessions
-      const { text, kb } = sessionsPage(res.sessions, 0, c.sessionId)
+      const { text, kb } = formatSessionsPage(res.sessions, c.sessionId, res.nextCursor ?? null)
       await ctx.reply(text, { parse_mode: 'HTML', reply_markup: kb })
     } catch (err) {
       await ctx.reply(`Failed to list sessions: ${esc(err instanceof Error ? err.message : String(err))}`, { parse_mode: 'HTML' })
@@ -377,13 +374,19 @@ export function createBot(config: Config) {
       await ctx.answerCallbackQuery()
       await ctx.editMessageReplyMarkup({ reply_markup: modelPageKb(c.models, page) })
     } else if (prefix === 'sessionspage') {
-      const suffix = ctx.callbackQuery.data.slice('sessionspage:'.length)
-      if (suffix === '_noop') return void (await ctx.answerCallbackQuery())
-      if (!c.cachedSessions.length) return void (await ctx.answerCallbackQuery({ text: 'No cached sessions.' }))
-      const page = parseInt(suffix, 10)
-      const { text, kb } = sessionsPage(c.cachedSessions, page, c.sessionId)
-      await ctx.answerCallbackQuery()
-      await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: kb })
+      const cursor = ctx.callbackQuery.data.slice('sessionspage:'.length)
+      try {
+        const res = await c.conn.unstable_listSessions({ cursor })
+        if (!res.sessions.length) {
+          await ctx.answerCallbackQuery({ text: 'No more sessions.' })
+          return
+        }
+        const { text, kb } = formatSessionsPage(res.sessions, c.sessionId, res.nextCursor ?? null)
+        await ctx.answerCallbackQuery()
+        await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: kb })
+      } catch (err) {
+        await ctx.answerCallbackQuery({ text: `Error: ${err instanceof Error ? err.message : err}` })
+      }
     } else if (prefix === 'cfg') {
       try {
         const result = await c.conn.setSessionConfigOption({ sessionId: c.sessionId, configId: id, value })
@@ -614,23 +617,16 @@ function flatOpts(opt: acp.SessionConfigOption): acp.SessionConfigSelectOption[]
   return opt.options as acp.SessionConfigSelectOption[]
 }
 
-function sessionsPage(sessions: acp.SessionInfo[], page: number, currentSessionId: string): { text: string; kb: InlineKeyboard } {
-  const pages = Math.ceil(sessions.length / SESSION_PAGE_SIZE)
-  const start = page * SESSION_PAGE_SIZE
-  const slice = sessions.slice(start, start + SESSION_PAGE_SIZE)
-  const lines = [`<b>Sessions</b> (${sessions.length} total)`]
-  for (const s of slice) {
+function formatSessionsPage(sessions: acp.SessionInfo[], currentSessionId: string, nextCursor: string | null): { text: string; kb: InlineKeyboard } {
+  const lines = ['<b>Sessions</b>']
+  for (const s of sessions) {
     const current = s.sessionId === currentSessionId ? ' \u2713' : ''
     const title = s.title ? ` \u2014 ${esc(s.title)}` : ''
     const updated = s.updatedAt ? `\n    Updated: ${esc(s.updatedAt)}` : ''
     lines.push(`  \u2022 <code>${esc(s.sessionId)}</code>${current}${title}\n    CWD: <code>${esc(s.cwd)}</code>${updated}`)
   }
   const kb = new InlineKeyboard()
-  if (pages > 1) {
-    if (page > 0) kb.text('\u25C0 Prev', `sessionspage:${page - 1}`)
-    kb.text(`${page + 1}/${pages}`, 'sessionspage:_noop')
-    if (page < pages - 1) kb.text('Next \u25B6', `sessionspage:${page + 1}`)
-  }
+  if (nextCursor) kb.text('Next \u25B6', `sessionspage:${nextCursor}`)
   return { text: lines.join('\n'), kb }
 }
 
