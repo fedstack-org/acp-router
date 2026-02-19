@@ -4,6 +4,8 @@ import type { Config } from './config.js'
 
 const TYPING_INTERVAL_MS = 4000
 const MAX_MESSAGE_LENGTH = 4096
+const MODEL_PAGE_SIZE = 8
+const MODEL_COLS = 2
 
 const BUILTIN_COMMANDS = [
   { command: 'start', description: 'Start a new Droid session' },
@@ -200,11 +202,7 @@ export function createBot(config: Config) {
     if (!c) return void (await ctx.reply('No active session.'))
     if (!c.models) return void (await ctx.reply('Models not available.'))
     const cur = c.models.availableModels.find((m) => m.modelId === c.models!.currentModelId)
-    const kb = new InlineKeyboard()
-    for (const m of c.models.availableModels) {
-      kb.text(`${m.modelId === c.models.currentModelId ? '\u2713 ' : ''}${m.name}`, `model:${m.modelId}`).row()
-    }
-    kb.text('\u274C Cancel', 'model:__cancel__')
+    const kb = modelPageKb(c.models, 0)
     await ctx.reply(`<b>Session Model</b>\nCurrent: <code>${esc(cur?.name ?? c.models.currentModelId)}</code>`, {
       parse_mode: 'HTML',
       reply_markup: kb
@@ -272,6 +270,13 @@ export function createBot(config: Config) {
       } catch (err) {
         await ctx.answerCallbackQuery({ text: `Error: ${err instanceof Error ? err.message : err}` })
       }
+    } else if (prefix === 'modelpage') {
+      const suffix = ctx.callbackQuery.data.slice('modelpage:'.length)
+      if (suffix === '_noop') return void (await ctx.answerCallbackQuery())
+      if (!c.models) return
+      const page = parseInt(suffix, 10)
+      await ctx.answerCallbackQuery()
+      await ctx.editMessageReplyMarkup({ reply_markup: modelPageKb(c.models, page) })
     } else if (prefix === 'cfg') {
       try {
         const result = await c.conn.setSessionConfigOption({ sessionId: c.sessionId, configId: id, value })
@@ -460,6 +465,27 @@ function flatOpts(opt: acp.SessionConfigOption): acp.SessionConfigSelectOption[]
   if (opt.options.length === 0) return []
   if ('group' in opt.options[0]) return (opt.options as acp.SessionConfigSelectGroup[]).flatMap((g) => g.options)
   return opt.options as acp.SessionConfigSelectOption[]
+}
+
+function modelPageKb(state: acp.SessionModelState, page: number): InlineKeyboard {
+  const all = state.availableModels
+  const pages = Math.ceil(all.length / MODEL_PAGE_SIZE)
+  const start = page * MODEL_PAGE_SIZE
+  const slice = all.slice(start, start + MODEL_PAGE_SIZE)
+  const kb = new InlineKeyboard()
+  for (let i = 0; i < slice.length; i++) {
+    const m = slice[i]
+    kb.text(`${m.modelId === state.currentModelId ? '\u2713 ' : ''}${m.name}`, `model:${m.modelId}`)
+    if ((i + 1) % MODEL_COLS === 0 || i === slice.length - 1) kb.row()
+  }
+  if (pages > 1) {
+    if (page > 0) kb.text('\u25C0 Prev', `modelpage:${page - 1}`)
+    kb.text(`${page + 1}/${pages}`, 'modelpage:_noop')
+    if (page < pages - 1) kb.text('Next \u25B6', `modelpage:${page + 1}`)
+    kb.row()
+  }
+  kb.text('\u274C Cancel', 'model:__cancel__')
+  return kb
 }
 
 function configKb(opt: acp.SessionConfigOption): InlineKeyboard {
