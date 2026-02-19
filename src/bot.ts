@@ -507,8 +507,8 @@ function sessionInfoMsg(c: RouterClient, resumed: boolean): string {
   lines.push(resumed ? '<b>Resumed session</b>' : '<b>New session</b>')
   lines.push(`Session ID: <code>${esc(c.sessionId)}</code>`)
   if (c.sessionTitle) lines.push(`Title: ${esc(c.sessionTitle)}`)
-  if (c.modes) lines.push(`Modes: ${c.modes.availableModes.map((m) => esc(m.name)).join(', ')}`)
-  if (c.models) lines.push(`Models: ${c.models.availableModels.map((m) => esc(m.name)).join(', ')}`)
+  if (c.modes) lines.push(`Modes:\n${c.modes.availableModes.map((m) => `  \u2022 <code>${esc(m.name)}</code>`).join('\n')}`)
+  if (c.models) lines.push(`Models:\n${c.models.availableModels.map((m) => `  \u2022 <code>${esc(m.name)}</code>`).join('\n')}`)
   if (c.configOptions.length) lines.push(`Options: ${c.configOptions.map((o) => esc(o.name)).join(', ')}`)
   return lines.join('\n')
 }
