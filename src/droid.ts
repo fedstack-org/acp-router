@@ -127,19 +127,39 @@ export class DroidSession extends EventEmitter {
       },
     })) as Record<string, unknown>;
 
-    console.log("[droid] initialized, agent:", JSON.stringify(initResult.agentInfo));
+    console.log("[droid] === Initialize Response ===");
+    console.log("[droid] Protocol version:", initResult.protocolVersion);
+    console.log("[droid] Agent info:", JSON.stringify(initResult.agentInfo, null, 2));
+    console.log("[droid] Agent capabilities:", JSON.stringify(initResult.agentCapabilities, null, 2));
+    if (initResult.authMethods) {
+      console.log("[droid] Auth methods:", JSON.stringify(initResult.authMethods, null, 2));
+    }
 
     const sessionResult = (await this.transport.request("session/new", {
       cwd: this.config.cwd ?? process.cwd(),
       mcpServers: [],
-    })) as { sessionId: string; configOptions?: ConfigOption[] };
+    })) as { sessionId: string; configOptions?: ConfigOption[]; modes?: unknown };
 
     this.sessionId = sessionResult.sessionId;
+    console.log("[droid] === Session Created ===");
+    console.log("[droid] Session ID:", this.sessionId);
+
     if (sessionResult.configOptions) {
       this._configOptions = sessionResult.configOptions;
+      console.log("[droid] Config options:");
+      for (const opt of this._configOptions) {
+        const values = opt.options.map((v) =>
+          v.value === opt.currentValue ? `[${v.name}]` : v.name,
+        );
+        console.log(`[droid]   ${opt.id} (${opt.category ?? "none"}): ${values.join(", ")}`);
+      }
     }
+
+    if (sessionResult.modes) {
+      console.log("[droid] Modes (legacy):", JSON.stringify(sessionResult.modes, null, 2));
+    }
+
     this._ready = true;
-    console.log("[droid] session created:", this.sessionId);
   }
 
   async prompt(text: string): Promise<string> {
@@ -213,12 +233,20 @@ export class DroidSession extends EventEmitter {
       case "available_commands_update": {
         const cmds = (update.availableCommands as AvailableCommand[]) ?? [];
         this._availableCommands = cmds;
+        console.log("[droid] Available commands updated:", cmds.map((c) => c.name).join(", "));
         this.emit("available_commands_update", cmds);
         break;
       }
       case "config_options_update": {
         const opts = (update.configOptions as ConfigOption[]) ?? [];
         this._configOptions = opts;
+        console.log("[droid] Config options updated:");
+        for (const opt of opts) {
+          const values = opt.options.map((v) =>
+            v.value === opt.currentValue ? `[${v.name}]` : v.name,
+          );
+          console.log(`[droid]   ${opt.id} (${opt.category ?? "none"}): ${values.join(", ")}`);
+        }
         this.emit("config_options_update", opts);
         break;
       }
