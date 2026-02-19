@@ -4,6 +4,7 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 import type { Config } from './config.js'
+import { StreamBuffer } from './stream-buffer.js'
 
 const CACHE_PATH = join(homedir(), '.config', 'acp-router.cache.json')
 
@@ -37,9 +38,6 @@ async function saveCachedSessionId(chatId: number, cwd: string, sessionId: strin
 }
 
 const TYPING_INTERVAL_MS = 4000
-const MAX_MESSAGE_LENGTH = 4096
-const FLUSH_THRESHOLD = 3000
-const FLUSH_INTERVAL_MS = 5000
 const MODEL_PAGE_SIZE = 8
 const MODEL_COLS = 2
 
@@ -74,6 +72,7 @@ class RouterClient implements acp.Client {
   ) {}
 
   async requestPermission(params: acp.RequestPermissionRequest): Promise<acp.RequestPermissionResponse> {
+    await this.flushBuffers()
     return new Promise<acp.RequestPermissionResponse>((resolve) => {
       this.pendingPerms.set(params.toolCall.toolCallId, resolve)
       const kb = new InlineKeyboard()
@@ -101,6 +100,7 @@ class RouterClient implements acp.Client {
         if (u.content.type === 'text') this.thoughtBuf?.append(u.content.text)
         break
       case 'tool_call':
+        await this.flushBuffers()
         try {
           const msg = await this.ctx.api.sendMessage(this.chatId, `${toolIcon(u.kind)} <code>${esc(u.title)}</code>`, {
             parse_mode: 'HTML'
@@ -154,6 +154,11 @@ class RouterClient implements acp.Client {
     } catch {
       /* ignore */
     }
+  }
+
+  async flushBuffers() {
+    if (this.thoughtBuf) await this.thoughtBuf.flush()
+    if (this.agentBuf) await this.agentBuf.flush()
   }
 
   clearTyping() {
@@ -400,8 +405,7 @@ async function doPrompt(ctx: Context, c: RouterClient, text: string) {
   try {
     const r = await c.conn.prompt({ sessionId: c.sessionId, prompt: [{ type: 'text', text }] })
     c.clearTyping()
-    await c.thoughtBuf.flush()
-    await c.agentBuf.flush()
+    await c.flushBuffers()
     if (r.stopReason !== 'end_turn') await ctx.reply(`Turn ended: ${r.stopReason}`)
   } catch (err) {
     c.clearTyping()
@@ -595,96 +599,6 @@ function configKb(opt: acp.SessionConfigOption): InlineKeyboard {
 function configMsg(opt: acp.SessionConfigOption): string {
   const d = opt.description ? `\n${esc(opt.description)}` : ''
   return `<b>${esc(opt.name)}</b>${d}\nCurrent: <code>${esc(opt.currentValue)}</code>`
-}
-
-function hasOpenCodeBlock(text: string): boolean {
-  let open = false
-  let i = 0
-  while (i < text.length) {
-    if (text.startsWith('```', i)) {
-      open = !open
-      i += 3
-      if (open) {
-        const nl = text.indexOf('\n', i)
-        if (nl !== -1) i = nl + 1
-      }
-    } else {
-      i++
-    }
-  }
-  return open
-}
-
-function findSafeSplit(text: string, max: number): number {
-  if (text.length <= max) return text.length
-  const fence = text.lastIndexOf('\n```', max)
-  if (fence > max / 2 && !hasOpenCodeBlock(text.slice(0, fence))) return fence
-  const dblNl = text.lastIndexOf('\n\n', max)
-  if (dblNl > max / 2 && !hasOpenCodeBlock(text.slice(0, dblNl))) return dblNl
-  const nl = text.lastIndexOf('\n', max)
-  if (nl > max / 2 && !hasOpenCodeBlock(text.slice(0, nl))) return nl
-  const sp = text.lastIndexOf(' ', max)
-  if (sp > max / 2 && !hasOpenCodeBlock(text.slice(0, sp))) return sp
-  return max
-}
-
-class StreamBuffer {
-  buf = ''
-  timer: ReturnType<typeof setTimeout> | null = null
-
-  constructor(
-    private ctx: Context,
-    private prefix = ''
-  ) {}
-
-  append(chunk: string) {
-    this.buf += chunk
-    if (this.buf.length >= FLUSH_THRESHOLD) {
-      this.scheduleFlush(0)
-    } else if (!this.timer) {
-      this.scheduleFlush(FLUSH_INTERVAL_MS)
-    }
-  }
-
-  private scheduleFlush(ms: number) {
-    if (this.timer) clearTimeout(this.timer)
-    this.timer = setTimeout(() => {
-      this.timer = null
-      this.doFlush().catch(() => {})
-    }, ms)
-  }
-
-  private async doFlush() {
-    while (this.buf.length >= FLUSH_THRESHOLD) {
-      const at = findSafeSplit(this.buf, MAX_MESSAGE_LENGTH)
-      const chunk = this.buf.slice(0, at)
-      this.buf = this.buf.slice(at).trimStart()
-      const msg = this.prefix ? `${this.prefix}${chunk}` : chunk
-      await this.ctx.reply(msg, { parse_mode: 'HTML' }).catch(() => {})
-      this.prefix = ''
-    }
-  }
-
-  async flush() {
-    if (this.timer) {
-      clearTimeout(this.timer)
-      this.timer = null
-    }
-    while (this.buf.length > MAX_MESSAGE_LENGTH) {
-      const at = findSafeSplit(this.buf, MAX_MESSAGE_LENGTH)
-      const chunk = this.buf.slice(0, at)
-      this.buf = this.buf.slice(at).trimStart()
-      const msg = this.prefix ? `${this.prefix}${chunk}` : chunk
-      await this.ctx.reply(msg, { parse_mode: 'HTML' }).catch(() => {})
-      this.prefix = ''
-    }
-    if (this.buf.trim()) {
-      const msg = this.prefix ? `${this.prefix}${this.buf}` : this.buf
-      await this.ctx.reply(msg, { parse_mode: 'HTML' }).catch(() => {})
-    }
-    this.buf = ''
-    this.prefix = ''
-  }
 }
 
 function esc(t: string) {
