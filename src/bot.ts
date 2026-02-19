@@ -275,14 +275,18 @@ export function createBot(config: Config) {
       const targetName = target?.name ?? modeId
       if (modeId === oldId) {
         await ctx.answerCallbackQuery({ text: `Already in ${targetName}` })
-        await ctx.editMessageText(`Mode remains to be <b>${esc(targetName)}</b> (<code>${esc(modeId)}</code>)`, { parse_mode: 'HTML' })
+        await ctx.editMessageText(`Mode remains to be <b>${esc(targetName)}</b> (<code>${esc(modeId)}</code>)`, {
+          parse_mode: 'HTML'
+        })
         return
       }
       try {
         await c.conn.setSessionMode({ sessionId: c.sessionId, modeId })
         c.modes.currentModeId = modeId
         await ctx.answerCallbackQuery({ text: `Mode \u2192 ${targetName}` })
-        await ctx.editMessageText(`Mode changed to <b>${esc(targetName)}</b> (<code>${esc(modeId)}</code>)`, { parse_mode: 'HTML' })
+        await ctx.editMessageText(`Mode changed to <b>${esc(targetName)}</b> (<code>${esc(modeId)}</code>)`, {
+          parse_mode: 'HTML'
+        })
       } catch (err) {
         await ctx.answerCallbackQuery({ text: `Error: ${err instanceof Error ? err.message : err}` })
       }
@@ -299,14 +303,18 @@ export function createBot(config: Config) {
       const targetName = target?.name ?? modelId
       if (modelId === oldId) {
         await ctx.answerCallbackQuery({ text: `Already using ${targetName}` })
-        await ctx.editMessageText(`Model remains to be <b>${esc(targetName)}</b> (<code>${esc(modelId)}</code>)`, { parse_mode: 'HTML' })
+        await ctx.editMessageText(`Model remains to be <b>${esc(targetName)}</b> (<code>${esc(modelId)}</code>)`, {
+          parse_mode: 'HTML'
+        })
         return
       }
       try {
         await c.conn.unstable_setSessionModel({ sessionId: c.sessionId, modelId })
         c.models.currentModelId = modelId
         await ctx.answerCallbackQuery({ text: `Model \u2192 ${targetName}` })
-        await ctx.editMessageText(`Model changed to <b>${esc(targetName)}</b> (<code>${esc(modelId)}</code>)`, { parse_mode: 'HTML' })
+        await ctx.editMessageText(`Model changed to <b>${esc(targetName)}</b> (<code>${esc(modelId)}</code>)`, {
+          parse_mode: 'HTML'
+        })
       } catch (err) {
         await ctx.answerCallbackQuery({ text: `Error: ${err instanceof Error ? err.message : err}` })
       }
@@ -452,23 +460,19 @@ async function initChat(
     c.agentInfo = init.agentInfo ?? null
 
     const cwd = d.cwd ?? process.cwd()
-    const caps = init.agentCapabilities?.sessionCapabilities
     let resumed = false
 
-    console.log('[droid] Resume check: caps.resume=%s, chatId=%d, cwd=%s', !!caps?.resume, chatId, cwd)
-    if (caps?.resume) {
-      const cachedId = await loadCachedSessionId(chatId, cwd)
-      console.log('[droid] Cached sessionId for chat %d cwd %s: %s', chatId, cwd, cachedId ?? '(none)')
-      if (cachedId) {
-        try {
-          console.log('[droid] Attempting unstable_resumeSession:', cachedId)
-          const s = await c.conn.unstable_resumeSession({ sessionId: cachedId, cwd })
-          c.sessionId = cachedId
-          applySessionState(c, s)
-          resumed = true
-        } catch (err) {
-          console.log('[droid] Resume failed, creating new session:', err instanceof Error ? err.message : err)
-        }
+    const cachedId = await loadCachedSessionId(chatId, cwd)
+    console.log('[droid] Cached sessionId for chat %d cwd %s: %s', chatId, cwd, cachedId ?? '(none)')
+    if (cachedId) {
+      try {
+        console.log('[droid] Attempting unstable_resumeSession:', cachedId)
+        const s = await c.conn.unstable_resumeSession({ sessionId: cachedId, cwd })
+        c.sessionId = cachedId
+        applySessionState(c, s)
+        resumed = true
+      } catch (err) {
+        console.log('[droid] Resume failed, creating new session:', err instanceof Error ? err.message : err)
       }
     }
 
@@ -492,7 +496,14 @@ async function initChat(
 
 // --- helpers ---
 
-function applySessionState(c: RouterClient, s: { configOptions?: acp.SessionConfigOption[] | null; modes?: acp.SessionModeState | null; models?: acp.SessionModelState | null }) {
+function applySessionState(
+  c: RouterClient,
+  s: {
+    configOptions?: acp.SessionConfigOption[] | null
+    modes?: acp.SessionModeState | null
+    models?: acp.SessionModelState | null
+  }
+) {
   console.log('[droid] Session:', c.sessionId)
   if (s.configOptions) {
     c.configOptions = s.configOptions
