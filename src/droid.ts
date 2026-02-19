@@ -16,6 +16,28 @@ export interface PermissionRequest {
   options: Array<{ optionId: string; name: string; kind: string }>;
 }
 
+export interface ConfigOptionValue {
+  value: string;
+  name: string;
+  description?: string;
+}
+
+export interface ConfigOption {
+  id: string;
+  name: string;
+  description?: string;
+  category?: string;
+  type: string;
+  currentValue: string;
+  options: ConfigOptionValue[];
+}
+
+export interface AvailableCommand {
+  name: string;
+  description: string;
+  input?: { hint: string };
+}
+
 export interface DroidSessionEvents {
   agent_message_chunk: (text: string) => void;
   thought_message_chunk: (text: string) => void;
@@ -23,6 +45,8 @@ export interface DroidSessionEvents {
   tool_call_update: (info: ToolCallInfo) => void;
   permission_request: (req: PermissionRequest) => void;
   turn_complete: (stopReason: string) => void;
+  available_commands_update: (commands: AvailableCommand[]) => void;
+  config_options_update: (options: ConfigOption[]) => void;
   error: (err: Error) => void;
   close: () => void;
   stderr: (text: string) => void;
@@ -36,8 +60,9 @@ export declare interface DroidSession {
 export class DroidSession extends EventEmitter {
   private transport: AcpTransport | null = null;
   private sessionId: string | null = null;
-  private promptResolve: ((stopReason: string) => void) | null = null;
   private _ready = false;
+  private _configOptions: ConfigOption[] = [];
+  private _availableCommands: AvailableCommand[] = [];
 
   constructor(private config: DroidConfig) {
     super();
@@ -45,6 +70,14 @@ export class DroidSession extends EventEmitter {
 
   get ready() {
     return this._ready && this.transport?.isAlive;
+  }
+
+  get configOptions(): ReadonlyArray<ConfigOption> {
+    return this._configOptions;
+  }
+
+  get availableCommands(): ReadonlyArray<AvailableCommand> {
+    return this._availableCommands;
   }
 
   async initialize(): Promise<void> {
@@ -81,7 +114,6 @@ export class DroidSession extends EventEmitter {
       return this.handlePermissionRequest(params);
     });
 
-    // ACP initialize
     const initResult = (await this.transport.request("initialize", {
       protocolVersion: 1,
       clientCapabilities: {
@@ -97,13 +129,15 @@ export class DroidSession extends EventEmitter {
 
     console.log("[droid] initialized, agent:", JSON.stringify(initResult.agentInfo));
 
-    // Create session
     const sessionResult = (await this.transport.request("session/new", {
       cwd: this.config.cwd ?? process.cwd(),
       mcpServers: [],
-    })) as { sessionId: string };
+    })) as { sessionId: string; configOptions?: ConfigOption[] };
 
     this.sessionId = sessionResult.sessionId;
+    if (sessionResult.configOptions) {
+      this._configOptions = sessionResult.configOptions;
+    }
     this._ready = true;
     console.log("[droid] session created:", this.sessionId);
   }
@@ -119,6 +153,21 @@ export class DroidSession extends EventEmitter {
     })) as { stopReason: string };
 
     return result.stopReason;
+  }
+
+  async setConfigOption(configId: string, value: string): Promise<ConfigOption[]> {
+    if (!this.transport || !this.sessionId) {
+      throw new Error("DroidSession not initialized");
+    }
+
+    const result = (await this.transport.request("session/set_config_option", {
+      sessionId: this.sessionId,
+      configId,
+      value,
+    })) as { configOptions: ConfigOption[] };
+
+    this._configOptions = result.configOptions;
+    return result.configOptions;
   }
 
   private handleSessionUpdate(params: unknown) {
@@ -161,8 +210,19 @@ export class DroidSession extends EventEmitter {
         });
         break;
       }
+      case "available_commands_update": {
+        const cmds = (update.availableCommands as AvailableCommand[]) ?? [];
+        this._availableCommands = cmds;
+        this.emit("available_commands_update", cmds);
+        break;
+      }
+      case "config_options_update": {
+        const opts = (update.configOptions as ConfigOption[]) ?? [];
+        this._configOptions = opts;
+        this.emit("config_options_update", opts);
+        break;
+      }
       case "plan": {
-        // We could emit plan events here if needed
         break;
       }
     }
@@ -177,7 +237,7 @@ export class DroidSession extends EventEmitter {
 
     return new Promise((resolve) => {
       const req: PermissionRequest = {
-        jsonRpcId: 0, // not needed; transport handles correlation
+        jsonRpcId: 0,
         sessionId: p.sessionId,
         toolCall: {
           toolCallId: (p.toolCall.toolCallId as string) ?? "",
@@ -188,7 +248,6 @@ export class DroidSession extends EventEmitter {
         options: p.options,
       };
 
-      // Store the resolve function so the bot can call it later
       this.permissionResolvers.set(req.toolCall.toolCallId, resolve);
       this.emit("permission_request", req);
     });
@@ -208,7 +267,6 @@ export class DroidSession extends EventEmitter {
     const resolve = this.permissionResolvers.get(toolCallId);
     if (resolve) {
       this.permissionResolvers.delete(toolCallId);
-      // Find a reject option or use cancelled
       resolve({ outcome: { outcome: "cancelled" } });
     }
   }
