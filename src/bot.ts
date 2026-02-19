@@ -45,6 +45,7 @@ const BUILTIN_COMMANDS = [
   { command: 'start', description: 'Start a new Droid session' },
   { command: 'cancel', description: 'Cancel current operation' },
   { command: 'help', description: 'Show available commands' },
+  { command: 'sessions', description: 'List existing sessions' },
   { command: 'mode', description: 'View/change session mode' },
   { command: 'model', description: 'View/change session model' }
 ]
@@ -248,6 +249,25 @@ export function createBot(config: Config) {
     await ctx.reply(text, { parse_mode: 'HTML' })
   })
 
+  bot.command('sessions', async (ctx) => {
+    const c = chats.get(ctx.chat.id)
+    if (!c) return void (await ctx.reply('No active session. Send /start first.'))
+    try {
+      const res = await c.conn.unstable_listSessions({})
+      if (!res.sessions.length) return void (await ctx.reply('No sessions found.'))
+      const lines = ['<b>Sessions:</b>']
+      for (const s of res.sessions) {
+        const current = s.sessionId === c.sessionId ? ' \u2713' : ''
+        const title = s.title ? ` — ${esc(s.title)}` : ''
+        const updated = s.updatedAt ? `\n    Updated: ${esc(s.updatedAt)}` : ''
+        lines.push(`  \u2022 <code>${esc(s.sessionId)}</code>${current}${title}\n    CWD: <code>${esc(s.cwd)}</code>${updated}`)
+      }
+      await ctx.reply(lines.join('\n'), { parse_mode: 'HTML' })
+    } catch (err) {
+      await ctx.reply(`Failed to list sessions: ${esc(err instanceof Error ? err.message : String(err))}`, { parse_mode: 'HTML' })
+    }
+  })
+
   bot.command('mode', async (ctx) => {
     const c = chats.get(ctx.chat.id)
     if (!c) return void (await ctx.reply('No active session.'))
@@ -403,7 +423,7 @@ export function createBot(config: Config) {
     if (text.startsWith('/')) {
       const si = text.indexOf(' ')
       const name = (si === -1 ? text.slice(1) : text.slice(1, si)).toLowerCase()
-      if (['start', 'cancel', 'help', 'mode', 'model'].includes(name)) return
+      if (['start', 'cancel', 'help', 'sessions', 'mode', 'model'].includes(name)) return
       const args = si === -1 ? '' : text.slice(si + 1)
       const cmd = c.availableCommands.find((x) => tgCmd(x.name) === name)
       if (cmd) return void (await doPrompt(ctx, c, args ? `/${cmd.name} ${args}` : `/${cmd.name}`))
