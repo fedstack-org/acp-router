@@ -7,23 +7,30 @@ import type { Config } from './config.js'
 
 const CACHE_PATH = join(homedir(), '.config', 'acp-router.cache.json')
 
-interface SessionCache {
-  sessionId: string
-  cwd: string
-}
+type SessionCacheData = Record<string, Record<string, string>>
 
-async function loadCache(): Promise<SessionCache | null> {
+async function loadCachedSessionId(chatId: number, cwd: string): Promise<string | null> {
   try {
-    return JSON.parse(await readFile(CACHE_PATH, 'utf-8'))
+    const data: SessionCacheData = JSON.parse(await readFile(CACHE_PATH, 'utf-8'))
+    return data[String(chatId)]?.[cwd] ?? null
   } catch {
     return null
   }
 }
 
-async function saveCache(cache: SessionCache): Promise<void> {
+async function saveCachedSessionId(chatId: number, cwd: string, sessionId: string): Promise<void> {
   try {
+    let data: SessionCacheData = {}
+    try {
+      data = JSON.parse(await readFile(CACHE_PATH, 'utf-8'))
+    } catch {
+      /* fresh file */
+    }
+    const key = String(chatId)
+    if (!data[key]) data[key] = {}
+    data[key][cwd] = sessionId
     await mkdir(dirname(CACHE_PATH), { recursive: true })
-    await writeFile(CACHE_PATH, JSON.stringify(cache, null, 2))
+    await writeFile(CACHE_PATH, JSON.stringify(data, null, 2))
   } catch {
     /* non-critical */
   }
@@ -452,12 +459,12 @@ async function initChat(
     let resumed = false
 
     if (caps?.resume) {
-      const cached = await loadCache()
-      if (cached && cached.cwd === cwd) {
+      const cachedId = await loadCachedSessionId(chatId, cwd)
+      if (cachedId) {
         try {
-          console.log('[droid] Resuming cached session:', cached.sessionId)
-          const s = await c.conn.unstable_resumeSession({ sessionId: cached.sessionId, cwd })
-          c.sessionId = cached.sessionId
+          console.log('[droid] Resuming cached session:', cachedId)
+          const s = await c.conn.unstable_resumeSession({ sessionId: cachedId, cwd })
+          c.sessionId = cachedId
           applySessionState(c, s)
           resumed = true
         } catch (err) {
@@ -472,7 +479,7 @@ async function initChat(
       applySessionState(c, s)
     }
 
-    await saveCache({ sessionId: c.sessionId, cwd })
+    await saveCachedSessionId(chatId, cwd, c.sessionId)
     chats.set(chatId, c)
     await c.syncCommands()
     await ctx.reply(sessionInfoMsg(c, resumed), { parse_mode: 'HTML' })
