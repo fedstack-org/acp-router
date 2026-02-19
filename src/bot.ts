@@ -1,6 +1,33 @@
 import { Bot, InlineKeyboard, type Context } from 'grammy'
 import * as acp from '@agentclientprotocol/sdk'
+import { readFile, writeFile, mkdir } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { join, dirname } from 'node:path'
 import type { Config } from './config.js'
+
+const CACHE_PATH = join(homedir(), '.config', 'acp-router.cache.json')
+
+interface SessionCache {
+  sessionId: string
+  cwd: string
+}
+
+async function loadCache(): Promise<SessionCache | null> {
+  try {
+    return JSON.parse(await readFile(CACHE_PATH, 'utf-8'))
+  } catch {
+    return null
+  }
+}
+
+async function saveCache(cache: SessionCache): Promise<void> {
+  try {
+    await mkdir(dirname(CACHE_PATH), { recursive: true })
+    await writeFile(CACHE_PATH, JSON.stringify(cache, null, 2))
+  } catch {
+    /* non-critical */
+  }
+}
 
 const TYPING_INTERVAL_MS = 4000
 const MAX_MESSAGE_LENGTH = 4096
@@ -420,20 +447,18 @@ async function initChat(
     const caps = init.agentCapabilities?.sessionCapabilities
     let resumed = false
 
-    if (caps?.list && caps?.resume) {
-      try {
-        const list = await c.conn.unstable_listSessions({ cwd })
-        const last = list.sessions.at(0)
-        if (last) {
-          console.log('[droid] Resuming session:', last.sessionId, last.title ?? '')
-          const s = await c.conn.unstable_resumeSession({ sessionId: last.sessionId, cwd })
-          c.sessionId = last.sessionId
-          c.sessionTitle = last.title ?? ''
+    if (caps?.resume) {
+      const cached = await loadCache()
+      if (cached && cached.cwd === cwd) {
+        try {
+          console.log('[droid] Resuming cached session:', cached.sessionId)
+          const s = await c.conn.unstable_resumeSession({ sessionId: cached.sessionId, cwd })
+          c.sessionId = cached.sessionId
           applySessionState(c, s)
           resumed = true
+        } catch (err) {
+          console.log('[droid] Resume failed, creating new session:', err instanceof Error ? err.message : err)
         }
-      } catch (err) {
-        console.log('[droid] Resume failed, creating new session:', err instanceof Error ? err.message : err)
       }
     }
 
@@ -443,6 +468,7 @@ async function initChat(
       applySessionState(c, s)
     }
 
+    await saveCache({ sessionId: c.sessionId, cwd })
     chats.set(chatId, c)
     await c.syncCommands()
     await ctx.reply(sessionInfoMsg(c, resumed), { parse_mode: 'HTML' })
