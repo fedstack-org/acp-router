@@ -132,10 +132,7 @@ class RouterClient implements acp.Client {
         await this.syncCommands()
         break
       case 'current_mode_update':
-        if (this.modes) {
-          this.modes.currentModeId = u.currentModeId
-          console.log('[droid] Mode changed to:', u.currentModeId)
-        }
+        if (this.modes) this.modes.currentModeId = u.currentModeId
         break
       case 'session_info_update':
         if (u.title != null) this.sessionTitle = u.title
@@ -458,11 +455,13 @@ async function initChat(
     const caps = init.agentCapabilities?.sessionCapabilities
     let resumed = false
 
+    console.log('[droid] Resume check: caps.resume=%s, chatId=%d, cwd=%s', !!caps?.resume, chatId, cwd)
     if (caps?.resume) {
       const cachedId = await loadCachedSessionId(chatId, cwd)
+      console.log('[droid] Cached sessionId for chat %d cwd %s: %s', chatId, cwd, cachedId ?? '(none)')
       if (cachedId) {
         try {
-          console.log('[droid] Resuming cached session:', cachedId)
+          console.log('[droid] Attempting unstable_resumeSession:', cachedId)
           const s = await c.conn.unstable_resumeSession({ sessionId: cachedId, cwd })
           c.sessionId = cachedId
           applySessionState(c, s)
@@ -499,14 +498,8 @@ function applySessionState(c: RouterClient, s: { configOptions?: acp.SessionConf
     c.configOptions = s.configOptions
     logConfigOptions(s.configOptions)
   }
-  if (s.modes) {
-    c.modes = s.modes
-    console.log('[droid] Modes:', JSON.stringify(s.modes, null, 2))
-  }
-  if (s.models) {
-    c.models = s.models
-    console.log('[droid] Models:', JSON.stringify(s.models, null, 2))
-  }
+  if (s.modes) c.modes = s.modes
+  if (s.models) c.models = s.models
 }
 
 function sessionInfoMsg(c: RouterClient, resumed: boolean): string {
