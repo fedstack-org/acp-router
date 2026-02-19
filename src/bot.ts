@@ -1,12 +1,7 @@
 import { Bot, InlineKeyboard, type Context } from "grammy";
+import type { SessionConfigOption, AvailableCommand, ToolKind } from "@agentclientprotocol/sdk";
+import { DroidSession, flattenConfigOptions, type PermissionRequest, type ToolCallInfo } from "./droid.js";
 import type { Config } from "./config.js";
-import {
-  DroidSession,
-  type AvailableCommand,
-  type ConfigOption,
-  type PermissionRequest,
-  type ToolCallInfo,
-} from "./droid.js";
 
 const TYPING_INTERVAL_MS = 4000;
 const MAX_MESSAGE_LENGTH = 4096;
@@ -17,6 +12,7 @@ interface ChatState {
   agentTextBuffer: string;
   thoughtBuffer: string;
   toolMessages: Map<string, number>;
+  pendingPermissions: Map<string, PermissionRequest>;
   busy: boolean;
 }
 
@@ -30,7 +26,6 @@ export function createBot(config: Config) {
   const bot = new Bot(config.telegramBotToken);
   const chats = new Map<number, ChatState>();
 
-  // Register base commands on startup
   bot.api.setMyCommands(BUILTIN_COMMANDS).catch(() => {});
 
   // Whitelist middleware
@@ -41,7 +36,6 @@ export function createBot(config: Config) {
     await next();
   });
 
-  // /start -- init session, no droid prompt
   bot.command("start", async (ctx) => {
     const chatId = ctx.chat.id;
     const existing = chats.get(chatId);
@@ -52,7 +46,6 @@ export function createBot(config: Config) {
     await initChat(chatId, ctx, config, chats);
   });
 
-  // /cancel -- cancel current turn
   bot.command("cancel", async (ctx) => {
     const chatId = ctx.chat.id;
     const state = chats.get(chatId);
@@ -64,7 +57,6 @@ export function createBot(config: Config) {
     await ctx.reply("Cancellation requested.");
   });
 
-  // /help -- list all commands
   bot.command("help", async (ctx) => {
     const chatId = ctx.chat.id;
     const state = chats.get(chatId);
@@ -79,7 +71,7 @@ export function createBot(config: Config) {
       if (acpCmds.length > 0) {
         text += "\n<b>Agent commands:</b>\n";
         for (const c of acpCmds) {
-          const name = c.name.toLowerCase().replace(/[^a-z0-9_]/g, "_");
+          const name = toTelegramCmd(c.name);
           const hint = c.input ? ` <i>${escapeHtml(c.input.hint)}</i>` : "";
           text += `/${name}${hint} — ${escapeHtml(c.description)}\n`;
         }
@@ -89,8 +81,9 @@ export function createBot(config: Config) {
       if (opts.length > 0) {
         text += "\n<b>Config options:</b>\n";
         for (const o of opts) {
-          const name = `set_${o.id.toLowerCase().replace(/[^a-z0-9_]/g, "_")}`;
-          const current = o.options.find((v) => v.value === o.currentValue)?.name ?? o.currentValue;
+          const name = `set_${toTelegramCmd(o.id)}`;
+          const flat = flattenConfigOptions(o);
+          const current = flat.find((v) => v.value === o.currentValue)?.name ?? o.currentValue;
           text += `/${name} — ${escapeHtml(o.name)} [${escapeHtml(current)}]\n`;
         }
       }
@@ -101,7 +94,6 @@ export function createBot(config: Config) {
     await ctx.reply(text, { parse_mode: "HTML" });
   });
 
-  // Callback queries for permissions and config options
   bot.on("callback_query:data", async (ctx) => {
     const data = ctx.callbackQuery.data;
     const chatId = ctx.chat?.id;
@@ -116,12 +108,10 @@ export function createBot(config: Config) {
     }
   });
 
-  // Text messages -- either ACP slash command or regular prompt
   bot.on("message:text", async (ctx) => {
     const chatId = ctx.chat.id;
     let state = chats.get(chatId);
 
-    // Auto-init on first message
     if (!state) {
       const newState = await initChat(chatId, ctx, config, chats);
       if (!newState) return;
@@ -129,7 +119,7 @@ export function createBot(config: Config) {
     }
 
     if (!state.session.ready) {
-      await ctx.reply("⏳ Reinitializing session...");
+      await ctx.reply("Reinitializing session...");
       try { await state.session.close(); } catch { /* ignore */ }
       const newState = await initChat(chatId, ctx, config, chats);
       if (!newState) return;
@@ -138,25 +128,20 @@ export function createBot(config: Config) {
 
     const text = ctx.message.text;
 
-    // Handle /set_xxx commands for config options
     if (text.startsWith("/set_")) {
       await handleSetCommand(ctx, state, text);
       return;
     }
 
-    // Handle Telegram commands that map to ACP slash commands
-    // Telegram sends "/command" or "/command args"
     if (text.startsWith("/")) {
       const spaceIdx = text.indexOf(" ");
       const cmdName = (spaceIdx === -1 ? text.slice(1) : text.slice(1, spaceIdx)).toLowerCase();
       const cmdArgs = spaceIdx === -1 ? "" : text.slice(spaceIdx + 1);
 
-      // Skip built-in commands we handle ourselves
       if (["start", "cancel", "help"].includes(cmdName)) return;
 
-      // Check if this is a known ACP command
       const acpCmd = state.session.availableCommands.find(
-        (c) => c.name.toLowerCase() === cmdName,
+        (c) => toTelegramCmd(c.name) === cmdName,
       );
       if (acpCmd) {
         const promptText = cmdArgs ? `/${acpCmd.name} ${cmdArgs}` : `/${acpCmd.name}`;
@@ -164,7 +149,6 @@ export function createBot(config: Config) {
         return;
       }
 
-      // Unknown command
       await ctx.reply(`Unknown command: /${cmdName}`);
       return;
     }
@@ -177,7 +161,7 @@ export function createBot(config: Config) {
 
 async function sendPrompt(ctx: Context, state: ChatState, text: string) {
   if (state.busy) {
-    await ctx.reply("⏳ Still processing. Please wait.");
+    await ctx.reply("Still processing. Please wait.");
     return;
   }
 
@@ -192,7 +176,7 @@ async function sendPrompt(ctx: Context, state: ChatState, text: string) {
     stopTyping(state);
 
     if (state.thoughtBuffer.trim()) {
-      await sendSplitMessages(ctx, `💭 <b>Thinking:</b>\n${escapeHtml(state.thoughtBuffer)}`, "HTML");
+      await sendSplitMessages(ctx, `<b>Thinking:</b>\n${escapeHtml(state.thoughtBuffer)}`, "HTML");
     }
 
     if (state.agentTextBuffer.trim()) {
@@ -200,41 +184,40 @@ async function sendPrompt(ctx: Context, state: ChatState, text: string) {
     }
 
     if (stopReason !== "end_turn") {
-      await ctx.reply(`ℹ️ Turn ended: ${stopReason}`);
+      await ctx.reply(`Turn ended: ${stopReason}`);
     }
   } catch (err) {
     stopTyping(state);
     const msg = err instanceof Error ? err.message : String(err);
-    await ctx.reply(`❌ Error: ${escapeHtml(msg)}`, { parse_mode: "HTML" });
+    await ctx.reply(`Error: ${escapeHtml(msg)}`, { parse_mode: "HTML" });
   } finally {
     state.busy = false;
   }
 }
 
 async function handleSetCommand(ctx: Context, state: ChatState, text: string) {
-  // /set_mode, /set_model, etc.
   const match = text.match(/^\/set_(\S+)/);
   if (!match) return;
 
   const configId = match[1];
-  const opt = state.session.configOptions.find((o) => o.id === configId);
+  const opt = state.session.configOptions.find((o) => toTelegramCmd(o.id) === configId);
   if (!opt) {
     await ctx.reply(`Unknown config option: ${configId}`);
     return;
   }
 
-  // Show InlineKeyboard with available values
+  const flat = flattenConfigOptions(opt);
   const keyboard = new InlineKeyboard();
-  for (let i = 0; i < opt.options.length; i++) {
-    const v = opt.options[i];
-    const current = v.value === opt.currentValue ? "✓ " : "";
-    keyboard.text(`${current}${v.name}`, `cfg:${configId}:${v.value}`);
+  for (let i = 0; i < flat.length; i++) {
+    const v = flat[i];
+    const current = v.value === opt.currentValue ? "\u2713 " : "";
+    keyboard.text(`${current}${v.name}`, `cfg:${opt.id}:${v.value}`);
     if ((i + 1) % 2 === 0) keyboard.row();
   }
 
   const desc = opt.description ? `\n${escapeHtml(opt.description)}` : "";
   await ctx.reply(
-    `⚙️ <b>${escapeHtml(opt.name)}</b>${desc}\nCurrent: <code>${escapeHtml(opt.currentValue)}</code>`,
+    `<b>${escapeHtml(opt.name)}</b>${desc}\nCurrent: <code>${escapeHtml(opt.currentValue)}</code>`,
     { parse_mode: "HTML", reply_markup: keyboard },
   );
 }
@@ -244,10 +227,14 @@ async function handlePermissionCallback(ctx: Context, state: ChatState, data: st
   if (parts.length !== 3) return;
   const [, toolCallId, optionId] = parts;
 
+  const req = state.pendingPermissions.get(toolCallId);
+  if (!req) return;
+  state.pendingPermissions.delete(toolCallId);
+
   if (optionId === "__reject__") {
-    state.session.rejectPermission(toolCallId);
+    state.session.rejectPermission(req);
   } else {
-    state.session.respondPermission(toolCallId, optionId);
+    state.session.respondPermission(req, optionId);
   }
 
   await ctx.answerCallbackQuery({ text: `Selected: ${optionId}` });
@@ -262,23 +249,23 @@ async function handleConfigCallback(ctx: Context, state: ChatState, data: string
   try {
     const updated = await state.session.setConfigOption(configId, value);
     const opt = updated.find((o) => o.id === configId);
+    const flat = opt ? flattenConfigOptions(opt) : [];
     const displayName = opt?.name ?? configId;
-    const displayValue = opt?.options.find((o) => o.value === value)?.name ?? value;
+    const displayValue = flat.find((o) => o.value === value)?.name ?? value;
 
-    await ctx.answerCallbackQuery({ text: `${displayName} → ${displayValue}` });
+    await ctx.answerCallbackQuery({ text: `${displayName} \u2192 ${displayValue}` });
 
-    // Rebuild keyboard with updated current value
     if (opt) {
       const keyboard = new InlineKeyboard();
-      for (let i = 0; i < opt.options.length; i++) {
-        const v = opt.options[i];
-        const current = v.value === opt.currentValue ? "✓ " : "";
+      for (let i = 0; i < flat.length; i++) {
+        const v = flat[i];
+        const current = v.value === opt.currentValue ? "\u2713 " : "";
         keyboard.text(`${current}${v.name}`, `cfg:${configId}:${v.value}`);
         if ((i + 1) % 2 === 0) keyboard.row();
       }
       const desc = opt.description ? `\n${escapeHtml(opt.description)}` : "";
       await ctx.editMessageText(
-        `⚙️ <b>${escapeHtml(opt.name)}</b>${desc}\nCurrent: <code>${escapeHtml(opt.currentValue)}</code>`,
+        `<b>${escapeHtml(opt.name)}</b>${desc}\nCurrent: <code>${escapeHtml(opt.currentValue)}</code>`,
         { parse_mode: "HTML", reply_markup: keyboard },
       );
     } else {
@@ -304,6 +291,7 @@ async function initChat(
     agentTextBuffer: "",
     thoughtBuffer: "",
     toolMessages: new Map(),
+    pendingPermissions: new Map(),
     busy: false,
   };
 
@@ -331,7 +319,7 @@ async function initChat(
     const msgId = state.toolMessages.get(info.toolCallId);
     if (!msgId) return;
     try {
-      const icon = info.status === "completed" ? "✅" : info.status === "failed" ? "❌" : "⏳";
+      const icon = info.status === "completed" ? "\u2705" : info.status === "failed" ? "\u274C" : "\u23F3";
       const title = info.title || "Tool operation";
       await ctx.api.editMessageText(chatId, msgId, `${icon} <code>${escapeHtml(title)}</code>`, {
         parse_mode: "HTML",
@@ -342,8 +330,10 @@ async function initChat(
   });
 
   session.on("permission_request", async (req: PermissionRequest) => {
+    state.pendingPermissions.set(req.toolCall.toolCallId, req);
+
     const keyboard = new InlineKeyboard();
-    const toolTitle = req.toolCall.title || "Unknown operation";
+    const toolTitle = req.toolCall.title ?? "Unknown operation";
 
     let rowCount = 0;
     for (const opt of req.options) {
@@ -355,7 +345,7 @@ async function initChat(
 
     await ctx.api.sendMessage(
       chatId,
-      `🔐 <b>Permission requested:</b>\n<code>${escapeHtml(toolTitle)}</code>`,
+      `<b>Permission requested:</b>\n<code>${escapeHtml(toolTitle)}</code>`,
       { parse_mode: "HTML", reply_markup: keyboard },
     );
   });
@@ -364,7 +354,7 @@ async function initChat(
     await registerTelegramCommands(ctx, commands, session.configOptions);
   });
 
-  session.on("config_options_update", async (options: ConfigOption[]) => {
+  session.on("config_options_update", async (options: SessionConfigOption[]) => {
     await registerTelegramCommands(ctx, session.availableCommands, options);
   });
 
@@ -381,15 +371,15 @@ async function initChat(
   });
 
   try {
-    await ctx.reply("🤖 Starting Droid session...");
+    await ctx.reply("Starting Droid session...");
     await session.initialize();
     chats.set(chatId, state);
     await registerTelegramCommands(ctx, session.availableCommands, session.configOptions);
-    await ctx.reply("✅ Droid session ready.");
+    await ctx.reply("Droid session ready.");
     return state;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    await ctx.reply(`❌ Failed to start Droid: ${escapeHtml(msg)}`, { parse_mode: "HTML" });
+    await ctx.reply(`Failed to start Droid: ${escapeHtml(msg)}`, { parse_mode: "HTML" });
     return null;
   }
 }
@@ -397,20 +387,20 @@ async function initChat(
 async function registerTelegramCommands(
   ctx: Context,
   acpCommands: ReadonlyArray<AvailableCommand>,
-  configOptions: ReadonlyArray<ConfigOption>,
+  configOptions: ReadonlyArray<SessionConfigOption>,
 ) {
   const commands: Array<{ command: string; description: string }> = [
     ...BUILTIN_COMMANDS,
   ];
 
   for (const cmd of acpCommands) {
-    const name = cmd.name.toLowerCase().replace(/[^a-z0-9_]/g, "_");
-    commands.push({ command: name, description: cmd.description });
+    commands.push({ command: toTelegramCmd(cmd.name), description: cmd.description });
   }
 
   for (const opt of configOptions) {
-    const name = `set_${opt.id.toLowerCase().replace(/[^a-z0-9_]/g, "_")}`;
-    const current = opt.options.find((o) => o.value === opt.currentValue)?.name ?? opt.currentValue;
+    const name = `set_${toTelegramCmd(opt.id)}`;
+    const flat = flattenConfigOptions(opt);
+    const current = flat.find((o) => o.value === opt.currentValue)?.name ?? opt.currentValue;
     commands.push({ command: name, description: `${opt.name} [${current}]` });
   }
 
@@ -419,6 +409,10 @@ async function registerTelegramCommands(
   } catch {
     // may fail if called too rapidly
   }
+}
+
+function toTelegramCmd(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9_]/g, "_");
 }
 
 function startTyping(ctx: Context, state: ChatState) {
@@ -462,25 +456,25 @@ function escapeHtml(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function toolIcon(kind?: string): string {
+function toolIcon(kind?: ToolKind): string {
   switch (kind) {
-    case "read": return "📖";
-    case "edit": return "✏️";
-    case "delete": return "🗑️";
-    case "execute": return "⚡";
-    case "search": return "🔍";
-    case "fetch": return "🌐";
-    case "think": return "💭";
-    default: return "🔧";
+    case "read": return "\uD83D\uDCD6";
+    case "edit": return "\u270F\uFE0F";
+    case "delete": return "\uD83D\uDDD1\uFE0F";
+    case "execute": return "\u26A1";
+    case "search": return "\uD83D\uDD0D";
+    case "fetch": return "\uD83C\uDF10";
+    case "think": return "\uD83D\uDCAD";
+    default: return "\uD83D\uDD27";
   }
 }
 
 function permissionIcon(kind: string): string {
   switch (kind) {
-    case "allow_once": return "✅";
-    case "allow_always": return "📋";
-    case "reject_once": return "❌";
-    case "reject_always": return "🚫";
-    default: return "❓";
+    case "allow_once": return "\u2705";
+    case "allow_always": return "\uD83D\uDCCB";
+    case "reject_once": return "\u274C";
+    case "reject_always": return "\uD83D\uDEAB";
+    default: return "\u2753";
   }
 }

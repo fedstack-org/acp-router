@@ -8,6 +8,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "^0.14.1",
     "grammy": "^1.35.0"
   },
   "devDependencies": {

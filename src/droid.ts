@@ -1,41 +1,40 @@
 import { EventEmitter } from "node:events";
-import { AcpTransport } from "./acp.js";
+import {
+  ClientSideConnection,
+  ndJsonStream,
+  PROTOCOL_VERSION,
+  type Agent,
+  type Client,
+  type SessionNotification,
+  type RequestPermissionRequest,
+  type RequestPermissionResponse,
+  type SessionUpdate,
+  type SessionConfigOption,
+  type AvailableCommand,
+  type ToolCallUpdate,
+  type ToolKind,
+  type ToolCallStatus,
+  type InitializeResponse,
+  type NewSessionResponse,
+  type SessionConfigSelectOption,
+  type SessionConfigSelectGroup,
+} from "@agentclientprotocol/sdk";
 import type { DroidConfig } from "./config.js";
+
+export type { SessionConfigOption, AvailableCommand, ToolKind, ToolCallStatus };
 
 export interface ToolCallInfo {
   toolCallId: string;
   title: string;
-  kind?: string;
-  status: string;
+  kind?: ToolKind;
+  status?: ToolCallStatus;
 }
 
 export interface PermissionRequest {
-  jsonRpcId: number;
   sessionId: string;
-  toolCall: ToolCallInfo;
-  options: Array<{ optionId: string; name: string; kind: string }>;
-}
-
-export interface ConfigOptionValue {
-  value: string;
-  name: string;
-  description?: string;
-}
-
-export interface ConfigOption {
-  id: string;
-  name: string;
-  description?: string;
-  category?: string;
-  type: string;
-  currentValue: string;
-  options: ConfigOptionValue[];
-}
-
-export interface AvailableCommand {
-  name: string;
-  description: string;
-  input?: { hint: string };
+  toolCall: ToolCallUpdate;
+  options: RequestPermissionRequest["options"];
+  resolve: (response: RequestPermissionResponse) => void;
 }
 
 export interface DroidSessionEvents {
@@ -44,9 +43,8 @@ export interface DroidSessionEvents {
   tool_call: (info: ToolCallInfo) => void;
   tool_call_update: (info: ToolCallInfo) => void;
   permission_request: (req: PermissionRequest) => void;
-  turn_complete: (stopReason: string) => void;
   available_commands_update: (commands: AvailableCommand[]) => void;
-  config_options_update: (options: ConfigOption[]) => void;
+  config_options_update: (options: SessionConfigOption[]) => void;
   error: (err: Error) => void;
   close: () => void;
   stderr: (text: string) => void;
@@ -57,11 +55,21 @@ export declare interface DroidSession {
   emit<E extends keyof DroidSessionEvents>(event: E, ...args: Parameters<DroidSessionEvents[E]>): boolean;
 }
 
+export function flattenConfigOptions(opt: SessionConfigOption): SessionConfigSelectOption[] {
+  const items = opt.options;
+  if (items.length === 0) return [];
+  if ("group" in items[0]) {
+    return (items as SessionConfigSelectGroup[]).flatMap((g) => g.options);
+  }
+  return items as SessionConfigSelectOption[];
+}
+
 export class DroidSession extends EventEmitter {
-  private transport: AcpTransport | null = null;
+  private connection: ClientSideConnection | null = null;
   private sessionId: string | null = null;
+  private proc: ReturnType<typeof Bun.spawn> | null = null;
   private _ready = false;
-  private _configOptions: ConfigOption[] = [];
+  private _configOptions: SessionConfigOption[] = [];
   private _availableCommands: AvailableCommand[] = [];
 
   constructor(private config: DroidConfig) {
@@ -69,10 +77,10 @@ export class DroidSession extends EventEmitter {
   }
 
   get ready() {
-    return this._ready && this.transport?.isAlive;
+    return this._ready && this.connection !== null && !this.connection.signal.aborted;
   }
 
-  get configOptions(): ReadonlyArray<ConfigOption> {
+  get configOptions(): ReadonlyArray<SessionConfigOption> {
     return this._configOptions;
   }
 
@@ -86,36 +94,60 @@ export class DroidSession extends EventEmitter {
     if (this.config.autoLevel) args.push("--auto", this.config.autoLevel);
     if (this.config.reasoningEffort) args.push("-r", this.config.reasoningEffort);
 
-    this.transport = new AcpTransport(["droid", ...args], {
-      DROID_DISABLE_AUTO_UPDATE: "true",
-      FACTORY_DROID_AUTO_UPDATE_ENABLED: "false",
+    this.proc = Bun.spawn(["droid", ...args], {
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+      env: {
+        ...process.env,
+        DROID_DISABLE_AUTO_UPDATE: "true",
+        FACTORY_DROID_AUTO_UPDATE_ENABLED: "false",
+      },
     });
 
-    this.transport.on("close", () => {
+    this.readStderr();
+
+    const stdout = this.proc.stdout as ReadableStream<Uint8Array>;
+    const stdin = this.proc.stdin as unknown as { write(data: string | Uint8Array): number; flush(): void; end(): void };
+
+    const writable = new WritableStream<Uint8Array>({
+      write(chunk) {
+        stdin.write(chunk);
+      },
+      close() {
+        stdin.end();
+      },
+    });
+
+    const stream = ndJsonStream(writable, stdout);
+    const self = this;
+
+    this.connection = new ClientSideConnection(
+      (_agent: Agent): Client => ({
+        async requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
+          return new Promise<RequestPermissionResponse>((resolve) => {
+            self.emit("permission_request", {
+              sessionId: params.sessionId,
+              toolCall: params.toolCall,
+              options: params.options,
+              resolve,
+            } satisfies PermissionRequest);
+          });
+        },
+        async sessionUpdate(params: SessionNotification): Promise<void> {
+          self.handleSessionUpdate(params.update);
+        },
+      }),
+      stream,
+    );
+
+    this.connection.signal.addEventListener("abort", () => {
       this._ready = false;
       this.emit("close");
     });
 
-    this.transport.on("error", (err: Error) => {
-      this.emit("error", err);
-    });
-
-    this.transport.on("stderr", (text: string) => {
-      this.emit("stderr", text);
-    });
-
-    this.transport.on("notification", (method: string, params: unknown) => {
-      if (method === "session/update") {
-        this.handleSessionUpdate(params);
-      }
-    });
-
-    this.transport.onRequest("session/request_permission", async (params) => {
-      return this.handlePermissionRequest(params);
-    });
-
-    const initResult = (await this.transport.request("initialize", {
-      protocolVersion: 1,
+    const initResult: InitializeResponse = await this.connection.initialize({
+      protocolVersion: PROTOCOL_VERSION,
       clientCapabilities: {
         fs: { readTextFile: false, writeTextFile: false },
         terminal: false,
@@ -125,7 +157,7 @@ export class DroidSession extends EventEmitter {
         title: "ACP Router (Telegram)",
         version: "0.1.0",
       },
-    })) as Record<string, unknown>;
+    });
 
     console.log("[droid] === Initialize Response ===");
     console.log("[droid] Protocol version:", initResult.protocolVersion);
@@ -135,10 +167,10 @@ export class DroidSession extends EventEmitter {
       console.log("[droid] Auth methods:", JSON.stringify(initResult.authMethods, null, 2));
     }
 
-    const sessionResult = (await this.transport.request("session/new", {
+    const sessionResult: NewSessionResponse = await this.connection.newSession({
       cwd: this.config.cwd ?? process.cwd(),
       mcpServers: [],
-    })) as { sessionId: string; configOptions?: ConfigOption[]; modes?: unknown };
+    });
 
     this.sessionId = sessionResult.sessionId;
     console.log("[droid] === Session Created ===");
@@ -146,170 +178,148 @@ export class DroidSession extends EventEmitter {
 
     if (sessionResult.configOptions) {
       this._configOptions = sessionResult.configOptions;
-      console.log("[droid] Config options:");
-      for (const opt of this._configOptions) {
-        const values = opt.options.map((v) =>
-          v.value === opt.currentValue ? `[${v.name}]` : v.name,
-        );
-        console.log(`[droid]   ${opt.id} (${opt.category ?? "none"}): ${values.join(", ")}`);
-      }
+      this.logConfigOptions(this._configOptions);
     }
 
     if (sessionResult.modes) {
-      console.log("[droid] Modes (legacy):", JSON.stringify(sessionResult.modes, null, 2));
+      console.log("[droid] Modes:", JSON.stringify(sessionResult.modes, null, 2));
     }
 
     this._ready = true;
   }
 
   async prompt(text: string): Promise<string> {
-    if (!this.transport || !this.sessionId) {
+    if (!this.connection || !this.sessionId) {
       throw new Error("DroidSession not initialized");
     }
 
-    const result = (await this.transport.request("session/prompt", {
+    const result = await this.connection.prompt({
       sessionId: this.sessionId,
       prompt: [{ type: "text", text }],
-    })) as { stopReason: string };
+    });
 
     return result.stopReason;
   }
 
-  async setConfigOption(configId: string, value: string): Promise<ConfigOption[]> {
-    if (!this.transport || !this.sessionId) {
+  async setConfigOption(configId: string, value: string): Promise<SessionConfigOption[]> {
+    if (!this.connection || !this.sessionId) {
       throw new Error("DroidSession not initialized");
     }
 
-    const result = (await this.transport.request("session/set_config_option", {
+    const result = await this.connection.setSessionConfigOption({
       sessionId: this.sessionId,
       configId,
       value,
-    })) as { configOptions: ConfigOption[] };
+    });
 
     this._configOptions = result.configOptions;
     return result.configOptions;
   }
 
-  private handleSessionUpdate(params: unknown) {
-    const p = params as Record<string, unknown>;
-    const update = p.update as Record<string, unknown>;
-    if (!update) return;
-
-    const updateType = update.sessionUpdate as string;
-
-    switch (updateType) {
-      case "agent_message_chunk": {
-        const content = update.content as { type: string; text?: string };
-        if (content?.text) {
-          this.emit("agent_message_chunk", content.text);
-        }
-        break;
-      }
-      case "thought_message_chunk": {
-        const content = update.content as { type: string; text?: string };
-        if (content?.text) {
-          this.emit("thought_message_chunk", content.text);
-        }
-        break;
-      }
-      case "tool_call": {
-        this.emit("tool_call", {
-          toolCallId: update.toolCallId as string,
-          title: update.title as string,
-          kind: update.kind as string | undefined,
-          status: (update.status as string) ?? "pending",
-        });
-        break;
-      }
-      case "tool_call_update": {
-        this.emit("tool_call_update", {
-          toolCallId: update.toolCallId as string,
-          title: (update.title as string) ?? "",
-          kind: update.kind as string | undefined,
-          status: (update.status as string) ?? "in_progress",
-        });
-        break;
-      }
-      case "available_commands_update": {
-        const cmds = (update.availableCommands as AvailableCommand[]) ?? [];
-        this._availableCommands = cmds;
-        console.log("[droid] Available commands updated:", cmds.map((c) => c.name).join(", "));
-        this.emit("available_commands_update", cmds);
-        break;
-      }
-      case "config_options_update": {
-        const opts = (update.configOptions as ConfigOption[]) ?? [];
-        this._configOptions = opts;
-        console.log("[droid] Config options updated:");
-        for (const opt of opts) {
-          const values = opt.options.map((v) =>
-            v.value === opt.currentValue ? `[${v.name}]` : v.name,
-          );
-          console.log(`[droid]   ${opt.id} (${opt.category ?? "none"}): ${values.join(", ")}`);
-        }
-        this.emit("config_options_update", opts);
-        break;
-      }
-      case "plan": {
-        break;
-      }
-    }
+  respondPermission(req: PermissionRequest, optionId: string) {
+    req.resolve({ outcome: { outcome: "selected", optionId } });
   }
 
-  private handlePermissionRequest(params: unknown): Promise<unknown> {
-    const p = params as {
-      sessionId: string;
-      toolCall: Record<string, unknown>;
-      options: Array<{ optionId: string; name: string; kind: string }>;
-    };
-
-    return new Promise((resolve) => {
-      const req: PermissionRequest = {
-        jsonRpcId: 0,
-        sessionId: p.sessionId,
-        toolCall: {
-          toolCallId: (p.toolCall.toolCallId as string) ?? "",
-          title: (p.toolCall.title as string) ?? "Unknown operation",
-          kind: p.toolCall.kind as string | undefined,
-          status: (p.toolCall.status as string) ?? "pending",
-        },
-        options: p.options,
-      };
-
-      this.permissionResolvers.set(req.toolCall.toolCallId, resolve);
-      this.emit("permission_request", req);
-    });
-  }
-
-  private permissionResolvers = new Map<string, (value: unknown) => void>();
-
-  respondPermission(toolCallId: string, optionId: string) {
-    const resolve = this.permissionResolvers.get(toolCallId);
-    if (resolve) {
-      this.permissionResolvers.delete(toolCallId);
-      resolve({ outcome: { outcome: "selected", optionId } });
-    }
-  }
-
-  rejectPermission(toolCallId: string) {
-    const resolve = this.permissionResolvers.get(toolCallId);
-    if (resolve) {
-      this.permissionResolvers.delete(toolCallId);
-      resolve({ outcome: { outcome: "cancelled" } });
-    }
+  rejectPermission(req: PermissionRequest) {
+    req.resolve({ outcome: { outcome: "cancelled" } });
   }
 
   cancel() {
-    if (this.transport && this.sessionId) {
-      this.transport.notify("session/cancel", { sessionId: this.sessionId });
+    if (this.connection && this.sessionId) {
+      this.connection.cancel({ sessionId: this.sessionId });
     }
   }
 
   async close() {
     this._ready = false;
-    if (this.transport) {
-      await this.transport.close();
-      this.transport = null;
+    if (this.proc) {
+      this.proc.kill();
+      this.proc = null;
+    }
+    this.connection = null;
+  }
+
+  private handleSessionUpdate(update: SessionUpdate) {
+    switch (update.sessionUpdate) {
+      case "agent_message_chunk": {
+        if (update.content.type === "text") {
+          this.emit("agent_message_chunk", update.content.text);
+        }
+        break;
+      }
+      case "agent_thought_chunk": {
+        if (update.content.type === "text") {
+          this.emit("thought_message_chunk", update.content.text);
+        }
+        break;
+      }
+      case "tool_call": {
+        this.emit("tool_call", {
+          toolCallId: update.toolCallId,
+          title: update.title,
+          kind: update.kind,
+          status: update.status,
+        });
+        break;
+      }
+      case "tool_call_update": {
+        this.emit("tool_call_update", {
+          toolCallId: update.toolCallId,
+          title: update.title ?? "",
+          kind: update.kind ?? undefined,
+          status: update.status ?? undefined,
+        });
+        break;
+      }
+      case "available_commands_update": {
+        this._availableCommands = update.availableCommands;
+        console.log("[droid] Available commands updated:", update.availableCommands.map((c) => c.name).join(", "));
+        this.emit("available_commands_update", update.availableCommands);
+        break;
+      }
+      case "config_option_update": {
+        this._configOptions = update.configOptions;
+        console.log("[droid] Config options updated:");
+        this.logConfigOptions(update.configOptions);
+        this.emit("config_options_update", update.configOptions);
+        break;
+      }
+      case "plan":
+      case "user_message_chunk":
+      case "current_mode_update":
+      case "session_info_update":
+      case "usage_update":
+        break;
+    }
+  }
+
+  private logConfigOptions(options: SessionConfigOption[]) {
+    console.log("[droid] Config options:");
+    for (const opt of options) {
+      const flat = flattenConfigOptions(opt);
+      const values = flat.map((v) =>
+        v.value === opt.currentValue ? `[${v.name}]` : v.name,
+      );
+      console.log(`[droid]   ${opt.id} (${opt.category ?? "none"}): ${values.join(", ")}`);
+    }
+  }
+
+  private async readStderr() {
+    if (!this.proc) return;
+    const stderr = this.proc.stderr as ReadableStream<Uint8Array>;
+    const reader = stderr.getReader();
+    const decoder = new TextDecoder();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const text = decoder.decode(value, { stream: true });
+        if (text.trim()) {
+          this.emit("stderr", text);
+        }
+      }
+    } catch {
+      // stream closed
     }
   }
 }
