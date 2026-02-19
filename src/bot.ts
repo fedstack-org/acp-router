@@ -250,8 +250,11 @@ export function createBot(config: Config) {
   })
 
   bot.command('sessions', async (ctx) => {
-    const c = chats.get(ctx.chat.id)
-    if (!c) return void (await ctx.reply('No active session. Send /start first.'))
+    let c = chats.get(ctx.chat.id)
+    if (!c) {
+      c = (await initChat(ctx.chat.id, ctx, config, chats)) ?? undefined
+      if (!c) return
+    }
     try {
       const res = await c.conn.unstable_listSessions({})
       if (!res.sessions.length) return void (await ctx.reply('No sessions found.'))
