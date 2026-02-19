@@ -427,7 +427,6 @@ export function createBot(config: Config) {
       const args = si === -1 ? '' : text.slice(si + 1)
       const cmd = c.availableCommands.find((x) => tgCmd(x.name) === name)
       if (cmd) return void (await doPrompt(ctx, c, args ? `/${cmd.name} ${args}` : `/${cmd.name}`))
-      return void (await ctx.reply(`Unknown command: /${name}`))
     }
 
     await doPrompt(ctx, c, text)
