@@ -19,6 +19,8 @@ class RouterClient implements acp.Client {
   conn!: acp.ClientSideConnection
   proc!: ReturnType<typeof Bun.spawn>
   sessionId = ''
+  agentInfo: acp.Implementation | null = null
+  sessionTitle = ''
   configOptions: acp.SessionConfigOption[] = []
   availableCommands: acp.AvailableCommand[] = []
   modes: acp.SessionModeState | null = null
@@ -100,6 +102,9 @@ class RouterClient implements acp.Client {
           this.modes.currentModeId = u.currentModeId
           console.log('[droid] Mode changed to:', u.currentModeId)
         }
+        break
+      case 'session_info_update':
+        if (u.title != null) this.sessionTitle = u.title
         break
     }
   }
@@ -409,25 +414,38 @@ async function initChat(
     console.log('[droid] Agent:', JSON.stringify(init.agentInfo, null, 2))
     console.log('[droid] Capabilities:', JSON.stringify(init.agentCapabilities, null, 2))
     if (init.authMethods) console.log('[droid] Auth:', JSON.stringify(init.authMethods, null, 2))
+    c.agentInfo = init.agentInfo ?? null
 
-    const s = await c.conn.newSession({ cwd: d.cwd ?? process.cwd(), mcpServers: [] })
-    c.sessionId = s.sessionId
-    console.log('[droid] Session:', c.sessionId)
-    if (s.configOptions) {
-      c.configOptions = s.configOptions
-      logConfigOptions(s.configOptions)
+    const cwd = d.cwd ?? process.cwd()
+    const caps = init.agentCapabilities?.sessionCapabilities
+    let resumed = false
+
+    if (caps?.list && caps?.resume) {
+      try {
+        const list = await c.conn.unstable_listSessions({ cwd })
+        const last = list.sessions.at(0)
+        if (last) {
+          console.log('[droid] Resuming session:', last.sessionId, last.title ?? '')
+          const s = await c.conn.unstable_resumeSession({ sessionId: last.sessionId, cwd })
+          c.sessionId = last.sessionId
+          c.sessionTitle = last.title ?? ''
+          applySessionState(c, s)
+          resumed = true
+        }
+      } catch (err) {
+        console.log('[droid] Resume failed, creating new session:', err instanceof Error ? err.message : err)
+      }
     }
-    if (s.modes) {
-      c.modes = s.modes
-      console.log('[droid] Modes:', JSON.stringify(s.modes, null, 2))
+
+    if (!resumed) {
+      const s = await c.conn.newSession({ cwd, mcpServers: [] })
+      c.sessionId = s.sessionId
+      applySessionState(c, s)
     }
-    if (s.models) {
-      c.models = s.models
-      console.log('[droid] Models:', JSON.stringify(s.models, null, 2))
-    }
+
     chats.set(chatId, c)
     await c.syncCommands()
-    await ctx.reply('Droid session ready.')
+    await ctx.reply(sessionInfoMsg(c, resumed), { parse_mode: 'HTML' })
     return c
   } catch (err) {
     proc.kill()
@@ -437,6 +455,33 @@ async function initChat(
 }
 
 // --- helpers ---
+
+function applySessionState(c: RouterClient, s: { configOptions?: acp.SessionConfigOption[] | null; modes?: acp.SessionModeState | null; models?: acp.SessionModelState | null }) {
+  console.log('[droid] Session:', c.sessionId)
+  if (s.configOptions) {
+    c.configOptions = s.configOptions
+    logConfigOptions(s.configOptions)
+  }
+  if (s.modes) {
+    c.modes = s.modes
+    console.log('[droid] Modes:', JSON.stringify(s.modes, null, 2))
+  }
+  if (s.models) {
+    c.models = s.models
+    console.log('[droid] Models:', JSON.stringify(s.models, null, 2))
+  }
+}
+
+function sessionInfoMsg(c: RouterClient, resumed: boolean): string {
+  const lines: string[] = []
+  lines.push(resumed ? '<b>Resumed session</b>' : '<b>New session</b>')
+  lines.push(`Session ID: <code>${esc(c.sessionId)}</code>`)
+  if (c.sessionTitle) lines.push(`Title: ${esc(c.sessionTitle)}`)
+  if (c.modes) lines.push(`Modes: ${c.modes.availableModes.map((m) => esc(m.name)).join(', ')}`)
+  if (c.models) lines.push(`Models: ${c.models.availableModels.map((m) => esc(m.name)).join(', ')}`)
+  if (c.configOptions.length) lines.push(`Options: ${c.configOptions.map((o) => esc(o.name)).join(', ')}`)
+  return lines.join('\n')
+}
 
 async function readStderr(proc: ReturnType<typeof Bun.spawn>, chatId: number) {
   const reader = (proc.stderr as ReadableStream<Uint8Array>).getReader()
