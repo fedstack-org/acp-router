@@ -496,14 +496,7 @@ async function initChat(
 
 // --- helpers ---
 
-function applySessionState(
-  c: RouterClient,
-  s: {
-    configOptions?: acp.SessionConfigOption[] | null
-    modes?: acp.SessionModeState | null
-    models?: acp.SessionModelState | null
-  }
-) {
+function applySessionState(c: RouterClient, s: acp.NewSessionResponse | acp.ResumeSessionResponse) {
   console.log('[droid] Session:', c.sessionId)
   if (s.configOptions) {
     c.configOptions = s.configOptions
