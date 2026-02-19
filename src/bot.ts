@@ -69,6 +69,10 @@ class RouterClient implements acp.Client {
   cachedSessionsCursor: string | null = null
   busy = false
 
+  get hasSession() {
+    return this.sessionId !== ''
+  }
+
   constructor(
     private chatId: number,
     private ctx: Context
@@ -226,13 +230,16 @@ export function createBot(config: Config) {
   })
 
   bot.command('start', async (ctx) => {
-    if (chats.has(ctx.chat.id)) return void (await ctx.reply('Session already active. Just send a message.'))
-    await initChat(ctx.chat.id, ctx, config, chats)
+    const c = chats.get(ctx.chat.id)
+    if (c?.hasSession) return void (await ctx.reply('Session already active. Just send a message.'))
+    const client = await ensureAgent(ctx.chat.id, ctx, config, chats)
+    if (!client) return
+    await ensureSession(client, ctx.chat.id, ctx, config)
   })
 
   bot.command('cancel', async (ctx) => {
     const c = chats.get(ctx.chat.id)
-    if (!c) return void (await ctx.reply('No active session.'))
+    if (!c?.hasSession) return void (await ctx.reply('No active session.'))
     c.conn.cancel({ sessionId: c.sessionId })
     await ctx.reply('Cancellation requested.')
   })
@@ -241,7 +248,7 @@ export function createBot(config: Config) {
     const c = chats.get(ctx.chat.id)
     let text = '<b>Built-in commands:</b>\n'
     for (const cmd of BUILTIN_COMMANDS) text += `/${cmd.command} — ${esc(cmd.description)}\n`
-    if (c) {
+    if (c?.hasSession) {
       if (c.availableCommands.length) {
         text += '\n<b>Agent commands:</b>\n'
         for (const cmd of c.availableCommands) {
@@ -263,11 +270,8 @@ export function createBot(config: Config) {
   })
 
   bot.command('sessions', async (ctx) => {
-    let c = chats.get(ctx.chat.id)
-    if (!c) {
-      c = (await initChat(ctx.chat.id, ctx, config, chats)) ?? undefined
-      if (!c) return
-    }
+    const c = await ensureAgent(ctx.chat.id, ctx, config, chats)
+    if (!c) return
     c.startTyping()
     try {
       const res = await c.conn.unstable_listSessions({})
@@ -285,7 +289,7 @@ export function createBot(config: Config) {
 
   bot.command('mode', async (ctx) => {
     const c = chats.get(ctx.chat.id)
-    if (!c) return void (await ctx.reply('No active session.'))
+    if (!c?.hasSession) return void (await ctx.reply('No active session. Send /start to begin.'))
     if (!c.modes) return void (await ctx.reply('Modes not available.'))
     const cur = c.modes.availableModes.find((m) => m.id === c.modes!.currentModeId)
     const kb = new InlineKeyboard()
@@ -301,7 +305,7 @@ export function createBot(config: Config) {
 
   bot.command('model', async (ctx) => {
     const c = chats.get(ctx.chat.id)
-    if (!c) return void (await ctx.reply('No active session.'))
+    if (!c?.hasSession) return void (await ctx.reply('No active session. Send /start to begin.'))
     if (!c.models) return void (await ctx.reply('Models not available.'))
     const cur = c.models.availableModels.find((m) => m.modelId === c.models!.currentModelId)
     const kb = modelPageKb(c.models, 0)
@@ -434,18 +438,22 @@ export function createBot(config: Config) {
 
   bot.on('message:text', async (ctx) => {
     const chatId = ctx.chat.id
-    let c: RouterClient | undefined = chats.get(chatId)
+    let c = chats.get(chatId)
 
-    if (!c) {
-      c = (await initChat(chatId, ctx, config, chats)) ?? undefined
-      if (!c) return
-    }
-    if (c.conn.signal.aborted) {
-      await ctx.reply('Reinitializing session...')
+    if (c && c.conn.signal.aborted) {
       c.destroy()
       chats.delete(chatId)
-      c = (await initChat(chatId, ctx, config, chats)) ?? undefined
-      if (!c) return
+      c = undefined
+    }
+
+    if (!c) {
+      const client = await ensureAgent(chatId, ctx, config, chats)
+      if (!client) return
+      c = client
+    }
+    if (!c.hasSession) {
+      const ok = await ensureSession(c, chatId, ctx, config)
+      if (!ok) return
     }
 
     const text = ctx.message.text
@@ -493,12 +501,20 @@ async function doPrompt(ctx: Context, c: RouterClient, text: string) {
   }
 }
 
-async function initChat(
+async function ensureAgent(
   chatId: number,
   ctx: Context,
   config: Config,
   chats: Map<number, RouterClient>
 ): Promise<RouterClient | null> {
+  const existing = chats.get(chatId)
+  if (existing && !existing.conn.signal.aborted) return existing
+
+  if (existing) {
+    existing.destroy()
+    chats.delete(chatId)
+  }
+
   const args = ['exec', '--output-format', 'acp']
   const d = config.droid
   if (d.model) args.push('-m', d.model)
@@ -542,21 +558,39 @@ async function initChat(
     console.log('[droid] Capabilities:', JSON.stringify(init.agentCapabilities, null, 2))
     if (init.authMethods) console.log('[droid] Auth:', JSON.stringify(init.authMethods, null, 2))
     c.agentInfo = init.agentInfo ?? null
+    chats.set(chatId, c)
+    return c
+  } catch (err) {
+    proc.kill()
+    await ctx.reply(`Failed to start Droid: ${esc(err instanceof Error ? err.message : String(err))}`, { parse_mode: 'HTML' })
+    return null
+  }
+}
 
-    const cwd = d.cwd ?? process.cwd()
-    let resumed = false
+async function ensureSession(
+  c: RouterClient,
+  chatId: number,
+  ctx: Context,
+  config: Config
+): Promise<boolean> {
+  if (c.hasSession) return true
 
+  const d = config.droid
+  const cwd = d.cwd ?? process.cwd()
+  let resumed = false
+
+  try {
     const cachedId = await loadCachedSessionId(chatId, cwd)
     console.log('[droid] Cached sessionId for chat %d cwd %s: %s', chatId, cwd, cachedId ?? '(none)')
     if (cachedId) {
       try {
-        console.log('[droid] Attempting unstable_resumeSession:', cachedId)
-        const s = await c.conn.unstable_resumeSession({ sessionId: cachedId, cwd })
+        console.log('[droid] Attempting loadSession:', cachedId)
+        const s = await c.conn.loadSession({ sessionId: cachedId, cwd, mcpServers: [] })
         c.sessionId = cachedId
         applySessionState(c, s)
         resumed = true
       } catch (err) {
-        console.log('[droid] Resume failed, creating new session:', err instanceof Error ? err.message : err)
+        console.log('[droid] Load failed, creating new session:', err instanceof Error ? err.message : err)
       }
     }
 
@@ -567,20 +601,18 @@ async function initChat(
     }
 
     await saveCachedSessionId(chatId, cwd, c.sessionId)
-    chats.set(chatId, c)
     await c.syncCommands()
-    await ctx.reply(sessionInfoMsg(c, resumed), { parse_mode: 'HTML' })
-    return c
+    await ctx.api.sendMessage(chatId, sessionInfoMsg(c, resumed), { parse_mode: 'HTML' })
+    return true
   } catch (err) {
-    proc.kill()
-    await ctx.reply(`Failed to start Droid: ${esc(err instanceof Error ? err.message : String(err))}`, { parse_mode: 'HTML' })
-    return null
+    await ctx.api.sendMessage(chatId, `Failed to create session: ${esc(err instanceof Error ? err.message : String(err))}`, { parse_mode: 'HTML' })
+    return false
   }
 }
 
 // --- helpers ---
 
-function applySessionState(c: RouterClient, s: acp.NewSessionResponse | acp.ResumeSessionResponse) {
+function applySessionState(c: RouterClient, s: acp.NewSessionResponse | acp.LoadSessionResponse) {
   console.log('[droid] Session:', c.sessionId)
   if (s.configOptions) {
     c.configOptions = s.configOptions
