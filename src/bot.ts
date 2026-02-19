@@ -596,17 +596,28 @@ async function ensureSession(
     const cachedId = await loadCachedSessionId(chatId, cwd)
     console.log('[droid] Cached sessionId for chat %d cwd %s: %s', chatId, cwd, cachedId ?? '(none)')
     if (cachedId) {
+      // Try resumeSession first (works for sessions created in current process)
       try {
-        console.log('[droid] Attempting loadSession:', cachedId)
-        c.muteUpdates = true
-        const s = await c.conn.loadSession({ sessionId: cachedId, cwd, mcpServers: [] })
-        c.muteUpdates = false
+        console.log('[droid] Attempting resumeSession:', cachedId)
+        const s = await c.conn.unstable_resumeSession({ sessionId: cachedId, cwd })
         c.sessionId = cachedId
         applySessionState(c, s)
         resumed = true
       } catch (err) {
-        c.muteUpdates = false
-        console.log('[droid] Load failed, creating new session:', err instanceof Error ? err.message : err)
+        console.log('[droid] Resume failed:', err instanceof Error ? err.message : err)
+        // Fallback to loadSession (works for sessions persisted on disk)
+        try {
+          console.log('[droid] Attempting loadSession:', cachedId)
+          c.muteUpdates = true
+          const s = await c.conn.loadSession({ sessionId: cachedId, cwd, mcpServers: [] })
+          c.muteUpdates = false
+          c.sessionId = cachedId
+          applySessionState(c, s)
+          resumed = true
+        } catch (err2) {
+          c.muteUpdates = false
+          console.log('[droid] Load failed, creating new session:', err2 instanceof Error ? err2.message : err2)
+        }
       }
     }
 
@@ -628,7 +639,7 @@ async function ensureSession(
 
 // --- helpers ---
 
-function applySessionState(c: RouterClient, s: acp.NewSessionResponse | acp.LoadSessionResponse) {
+function applySessionState(c: RouterClient, s: acp.NewSessionResponse | acp.LoadSessionResponse | acp.ResumeSessionResponse) {
   console.log('[droid] Session:', c.sessionId)
   if (s.configOptions) {
     c.configOptions = s.configOptions
