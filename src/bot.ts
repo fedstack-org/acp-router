@@ -68,6 +68,7 @@ class RouterClient implements acp.Client {
   cachedSessions: acp.SessionInfo[] = []
   cachedSessionsCursor: string | null = null
   busy = false
+  muteUpdates = false
 
   get hasSession() {
     return this.sessionId !== ''
@@ -111,23 +112,26 @@ class RouterClient implements acp.Client {
     const u = params.update
     switch (u.sessionUpdate) {
       case 'agent_message_chunk':
-        await this.handleContentBlock(u.content)
+        if (!this.muteUpdates) await this.handleContentBlock(u.content)
         break
       case 'agent_thought_chunk':
-        await this.handleContentBlock(u.content)
+        if (!this.muteUpdates) await this.handleContentBlock(u.content)
         break
       case 'tool_call':
-        await this.flushBuffers()
-        try {
-          const msg = await this.ctx.api.sendMessage(this.chatId, `${toolIcon(u.kind)} <code>${esc(u.title)}</code>`, {
-            parse_mode: 'HTML'
-          })
-          this.toolMsgs.set(u.toolCallId, msg.message_id)
-        } catch {
-          /* non-critical */
+        if (!this.muteUpdates) {
+          await this.flushBuffers()
+          try {
+            const msg = await this.ctx.api.sendMessage(this.chatId, `${toolIcon(u.kind)} <code>${esc(u.title)}</code>`, {
+              parse_mode: 'HTML'
+            })
+            this.toolMsgs.set(u.toolCallId, msg.message_id)
+          } catch {
+            /* non-critical */
+          }
         }
         break
       case 'tool_call_update': {
+        if (this.muteUpdates) break
         const msgId = this.toolMsgs.get(u.toolCallId)
         if (!msgId) break
         const icon = u.status === 'completed' ? '\u2705' : u.status === 'failed' ? '\u274C' : '\u23F3'
@@ -594,11 +598,14 @@ async function ensureSession(
     if (cachedId) {
       try {
         console.log('[droid] Attempting loadSession:', cachedId)
+        c.muteUpdates = true
         const s = await c.conn.loadSession({ sessionId: cachedId, cwd, mcpServers: [] })
+        c.muteUpdates = false
         c.sessionId = cachedId
         applySessionState(c, s)
         resumed = true
       } catch (err) {
+        c.muteUpdates = false
         console.log('[droid] Load failed, creating new session:', err instanceof Error ? err.message : err)
       }
     }
