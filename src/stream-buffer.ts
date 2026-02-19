@@ -39,10 +39,7 @@ export class StreamBuffer {
   buf = ''
   timer: ReturnType<typeof setTimeout> | null = null
 
-  constructor(
-    private ctx: Context,
-    private prefix = ''
-  ) {}
+  constructor(private ctx: Context) {}
 
   append(chunk: string) {
     this.buf += chunk
@@ -66,9 +63,7 @@ export class StreamBuffer {
       const at = findSafeSplit(this.buf, MAX_MESSAGE_LENGTH)
       const chunk = this.buf.slice(0, at)
       this.buf = this.buf.slice(at).trimStart()
-      const msg = this.prefix ? `${this.prefix}${chunk}` : chunk
-      await this.ctx.reply(msg, { parse_mode: 'HTML' }).catch(() => {})
-      this.prefix = ''
+      await this.ctx.reply(chunk, { parse_mode: 'HTML' }).catch(() => {})
     }
   }
 
@@ -81,15 +76,11 @@ export class StreamBuffer {
       const at = findSafeSplit(this.buf, MAX_MESSAGE_LENGTH)
       const chunk = this.buf.slice(0, at)
       this.buf = this.buf.slice(at).trimStart()
-      const msg = this.prefix ? `${this.prefix}${chunk}` : chunk
-      await this.ctx.reply(msg, { parse_mode: 'HTML' }).catch(() => {})
-      this.prefix = ''
+      await this.ctx.reply(chunk, { parse_mode: 'HTML' }).catch(() => {})
     }
     if (this.buf.trim()) {
-      const msg = this.prefix ? `${this.prefix}${this.buf}` : this.buf
-      await this.ctx.reply(msg, { parse_mode: 'HTML' }).catch(() => {})
+      await this.ctx.reply(this.buf, { parse_mode: 'HTML' }).catch(() => {})
     }
     this.buf = ''
-    this.prefix = ''
   }
 }

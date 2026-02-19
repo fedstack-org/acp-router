@@ -60,8 +60,7 @@ class RouterClient implements acp.Client {
   modes: acp.SessionModeState | null = null
   models: acp.SessionModelState | null = null
   typingInterval: ReturnType<typeof setInterval> | null = null
-  thoughtBuf: StreamBuffer | null = null
-  agentBuf: StreamBuffer | null = null
+  streamBuf: StreamBuffer | null = null
   toolMsgs = new Map<string, number>()
   pendingPerms = new Map<string, (r: acp.RequestPermissionResponse) => void>()
   busy = false
@@ -94,10 +93,10 @@ class RouterClient implements acp.Client {
     const u = params.update
     switch (u.sessionUpdate) {
       case 'agent_message_chunk':
-        if (u.content.type === 'text') this.agentBuf?.append(u.content.text)
+        if (u.content.type === 'text') this.streamBuf?.append(u.content.text)
         break
       case 'agent_thought_chunk':
-        if (u.content.type === 'text') this.thoughtBuf?.append(u.content.text)
+        if (u.content.type === 'text') this.streamBuf?.append(u.content.text)
         break
       case 'tool_call':
         await this.flushBuffers()
@@ -157,8 +156,7 @@ class RouterClient implements acp.Client {
   }
 
   async flushBuffers() {
-    if (this.thoughtBuf) await this.thoughtBuf.flush()
-    if (this.agentBuf) await this.agentBuf.flush()
+    if (this.streamBuf) await this.streamBuf.flush()
   }
 
   clearTyping() {
@@ -395,8 +393,7 @@ export function createBot(config: Config) {
 async function doPrompt(ctx: Context, c: RouterClient, text: string) {
   if (c.busy) return void (await ctx.reply('Still processing. Please wait.'))
   c.busy = true
-  c.thoughtBuf = new StreamBuffer(ctx, '<b>Thinking:</b>\n')
-  c.agentBuf = new StreamBuffer(ctx)
+  c.streamBuf = new StreamBuffer(ctx)
   const chatId = ctx.chat!.id
   const tick = () => ctx.api.sendChatAction(chatId, 'typing').catch(() => {})
   tick()
@@ -411,8 +408,7 @@ async function doPrompt(ctx: Context, c: RouterClient, text: string) {
     c.clearTyping()
     await ctx.reply(`Error: ${esc(err instanceof Error ? err.message : String(err))}`, { parse_mode: 'HTML' })
   } finally {
-    c.thoughtBuf = null
-    c.agentBuf = null
+    c.streamBuf = null
     c.busy = false
   }
 }
