@@ -243,7 +243,11 @@ export function createBot(config: Config) {
 
   bot.on('callback_query:data', async (ctx) => {
     const c = chats.get(ctx.chat!.id)
-    if (!c) return
+    if (!c) {
+      await ctx.answerCallbackQuery({ text: 'Session expired. Send /start to begin a new session.' })
+      await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {})
+      return
+    }
     const [prefix, id, value] = ctx.callbackQuery.data.split(':')
     if (prefix === 'perm') {
       const resolve = c.pendingPerms.get(id)
