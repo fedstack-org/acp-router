@@ -32,6 +32,9 @@ export interface RouterClientState {
   session: RouterSessionState | null
 }
 
+const TEXT_FLUSH_DELAY = 3000
+const TEXT_FLUSH_MAX_LEN = 3500
+
 export class RouterClient implements acp.Client {
   conn!: acp.ClientSideConnection
   sessionId = ''
@@ -41,6 +44,13 @@ export class RouterClient implements acp.Client {
   availableCommands: AvailableCommand[] = []
   modes: SessionModeState | null = null
   models: SessionModelState | null = null
+
+  private textBuffer = ''
+  private flushTimer: ReturnType<typeof setTimeout> | null = null
+  private toolCalls = new Map<string, { messageId: string; title: string }>()
+  private updateQueue: Promise<void> = Promise.resolve()
+  muteUpdates = false
+  statusMessageId: string | null = null
 
   constructor(
     private adapter: IMAdapter,
@@ -65,26 +75,88 @@ export class RouterClient implements acp.Client {
   }
 
   async requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
-    return this.presentToolApproval(params)
+    const toolCallId = params.toolCall.toolCallId
+    logger.debug({ chatId: this.chatId, toolCallId }, 'Permission requested')
+    const result = await this.presentToolApproval(params)
+    const tc = this.toolCalls.get(toolCallId)
+    logger.debug({ chatId: this.chatId, toolCallId, messageId: tc?.messageId, outcome: result.outcome.outcome }, 'Permission resolved')
+    if (tc) {
+      const label = result.outcome.outcome === 'cancelled' ? 'cancelled' : result.outcome.outcome === 'selected' ? 'approved' : 'resolved'
+      await this.adapter.updateInteractiveMessage(this.chatId, tc.messageId, {
+        markdown: `**Permission ${label}:** ${tc.title}`,
+        actions: null
+      })
+    } else {
+      logger.warn({ chatId: this.chatId, toolCallId }, 'No message found for permission resolution')
+    }
+    return result
+  }
+
+  private enqueue<T>(fn: () => Promise<T>): Promise<T> {
+    const task = this.updateQueue.then(fn, fn)
+    this.updateQueue = task.then(() => {}, () => {})
+    return task
   }
 
   async sessionUpdate(params: acp.SessionNotification): Promise<void> {
+    return this.enqueue(() => this.processUpdate(params))
+  }
+
+  private async processUpdate(params: acp.SessionNotification): Promise<void> {
     const update = params.update
+    if (this.muteUpdates) {
+      switch (update.sessionUpdate) {
+        case 'available_commands_update':
+          this.availableCommands = update.availableCommands
+          await this.syncCommands()
+          break
+        case 'config_option_update':
+          this.configOptions = update.configOptions
+          await this.syncCommands()
+          break
+        case 'current_mode_update':
+          if (this.modes) this.modes.currentModeId = update.currentModeId
+          break
+        case 'session_info_update':
+          if (update.title != null) this.title = update.title
+          break
+      }
+      return
+    }
     switch (update.sessionUpdate) {
       case 'agent_message_chunk':
       case 'agent_thought_chunk': {
         await this.handleContent(update.content)
         break
       }
-      case 'tool_call':
-        if (update.title) {
-          await this.adapter.sendMarkdownText(this.chatId, `**Tool call:** ${update.title}`)
-        }
+      case 'tool_call': {
+        await this.flushTextBuffer()
+        const toolTitle = update.title ?? 'Tool'
+        logger.debug({ chatId: this.chatId, toolCallId: update.toolCallId, title: toolTitle }, 'Tool call started')
+        const interaction = await this.adapter.sendInteractiveMessage(this.chatId, {
+          markdown: `**Tool call:** ${toolTitle}`
+        })
+        logger.debug({ chatId: this.chatId, toolCallId: update.toolCallId, messageId: interaction.id }, 'Tool call message sent')
+        this.toolCalls.set(update.toolCallId, { messageId: interaction.id, title: toolTitle })
         break
+      }
       case 'tool_call_update': {
-        if (update.title) {
-          const statusLabel = update.status === 'completed' ? 'completed' : update.status === 'failed' ? 'failed' : 'updated'
-          await this.adapter.sendMarkdownText(this.chatId, `**Tool ${statusLabel}:** ${update.title}`)
+        await this.flushTextBuffer()
+        const tc = this.toolCalls.get(update.toolCallId)
+        if (update.title && tc) tc.title = update.title
+        const toolTitle = tc?.title ?? 'Tool'
+        const statusLabel = update.status === 'completed' ? 'completed' : update.status === 'failed' ? 'failed' : 'running'
+        const text = `**Tool ${statusLabel}:** ${toolTitle}`
+        logger.debug({ chatId: this.chatId, toolCallId: update.toolCallId, status: update.status, messageId: tc?.messageId }, 'Tool call update')
+        if (tc) {
+          const terminal = update.status === 'completed' || update.status === 'failed'
+          await this.adapter.updateInteractiveMessage(this.chatId, tc.messageId, { markdown: text, actions: null })
+          if (terminal) {
+            this.toolCalls.delete(update.toolCallId)
+          }
+        } else {
+          logger.warn({ chatId: this.chatId, toolCallId: update.toolCallId }, 'No message found for tool call update, sending as new message')
+          await this.adapter.sendMarkdownText(this.chatId, text)
         }
         break
       }
@@ -110,33 +182,76 @@ export class RouterClient implements acp.Client {
     await this.adapter.setCommands(commands)
   }
 
+  private scheduleFlush() {
+    if (this.flushTimer) return
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null
+      this.flushTextBuffer().catch(() => {})
+    }, TEXT_FLUSH_DELAY)
+  }
+
+  async flushTextBuffer(): Promise<void> {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer)
+      this.flushTimer = null
+    }
+    if (!this.textBuffer) return
+    const text = this.textBuffer
+    this.textBuffer = ''
+    await this.adapter.sendMarkdownText(this.chatId, text)
+  }
+
   async handleContent(block: ContentBlock) {
     const normalized = normalizeContent(block)
-    if (normalized.kind === 'text') return this.adapter.sendMarkdownText(this.chatId, normalized.text)
+    if (normalized.kind === 'text') {
+      this.textBuffer += normalized.text
+      if (this.textBuffer.length >= TEXT_FLUSH_MAX_LEN) {
+        await this.flushTextBuffer()
+      } else {
+        this.scheduleFlush()
+      }
+      return
+    }
+    await this.flushTextBuffer()
     if (normalized.kind === 'unknown') return this.adapter.sendMarkdownText(this.chatId, `[Content: ${normalized.type}]`)
     return this.adapter.sendMedia(this.chatId, normalized)
   }
 
   private async presentToolApproval(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
     const title = params.toolCall.title ?? 'Tool'
+    const toolCallId = params.toolCall.toolCallId
     const nonce = Date.now().toString(36)
     const actions = params.options.map((opt) => ({
       id: `acp:tool:${nonce}:select:${opt.optionId}`,
       label: opt.name
     }))
-    let resolveApproval: ((value: RequestPermissionResponse) => void) | null = null
+    let resolveApproval!: (value: RequestPermissionResponse) => void
     const approvalPromise = new Promise<RequestPermissionResponse>((resolve) => {
       resolveApproval = resolve
+    })
+    await this.enqueue(async () => {
       const callback = async (actionId: string) => {
         const optionId = actionId.split(':')[4] ?? ''
-        resolve({ outcome: { outcome: 'selected', optionId } })
+        resolveApproval({ outcome: { outcome: 'selected', optionId } })
       }
-      this.adapter
-        .sendInteractiveMessage(this.chatId, {
-          markdown: `**Permission requested:** ${title}`,
-          actions: { items: actions, callback }
-        })
-        .catch(() => resolve(selectRejectOutcome(params)))
+      const inlineActions = { items: actions, callback }
+      const tc = this.toolCalls.get(toolCallId)
+      if (tc) {
+        await this.adapter
+          .updateInteractiveMessage(this.chatId, tc.messageId, {
+            markdown: `**Permission requested:** ${title}`,
+            actions: inlineActions
+          })
+          .catch(() => resolveApproval(selectRejectOutcome(params)))
+      } else {
+        await this.adapter
+          .sendInteractiveMessage(this.chatId, {
+            markdown: `**Permission requested:** ${title}`,
+            actions: inlineActions
+          })
+          .then((interaction) => this.toolCalls.set(toolCallId, { messageId: interaction.id, title }))
+          .catch(() => resolveApproval(selectRejectOutcome(params)))
+      }
     })
     if (!this.permissions.timeoutMs) return approvalPromise
     return Promise.race([
@@ -200,24 +315,61 @@ export class RouterCore {
   async startSession(chatId: string, agentId: string, launch: AgentLaunchRequest, cwd: string) {
     const client = await this.ensureClient(chatId, agentId, launch)
     if (client.sessionId) return client
+
+    const statusMsg = await this.adapter.sendInteractiveMessage(chatId, {
+      markdown: '**Starting session...**'
+    })
+    client.statusMessageId = statusMsg.id
+
     const cached = await this.cache.get(cacheKey(chatId, cwd))
     if (cached) {
+      // Try resume (lightweight, no history replay)
       try {
+        await this.adapter.updateInteractiveMessage(chatId, statusMsg.id, {
+          markdown: '**Resuming session...**'
+        })
         const res = await client.conn.unstable_resumeSession({ sessionId: cached, cwd })
         client.sessionId = cached
         applySessionState(client, res)
         logger.info({ chatId, sessionId: cached }, 'Resumed session')
+        await this.adapter.updateInteractiveMessage(chatId, statusMsg.id, {
+          markdown: `**Session resumed** (${cached})`
+        })
         return client
-      } catch {
-        logger.warn({ chatId, sessionId: cached }, 'Failed to resume session; starting new')
-        // fallthrough to new
+      } catch (err) {
+        logger.warn({ chatId, sessionId: cached, err }, 'Failed to resume session; trying load')
+      }
+      // Try load (replays history, mute updates to avoid flooding)
+      try {
+        await this.adapter.updateInteractiveMessage(chatId, statusMsg.id, {
+          markdown: '**Loading session...**'
+        })
+        client.muteUpdates = true
+        const res = await client.conn.loadSession({ sessionId: cached, cwd, mcpServers: [] })
+        client.muteUpdates = false
+        client.sessionId = cached
+        applySessionState(client, res)
+        logger.info({ chatId, sessionId: cached }, 'Loaded session')
+        await this.adapter.updateInteractiveMessage(chatId, statusMsg.id, {
+          markdown: `**Session loaded** (${cached})`
+        })
+        return client
+      } catch (err) {
+        client.muteUpdates = false
+        logger.warn({ chatId, sessionId: cached, err }, 'Failed to load session; creating new')
       }
     }
+    await this.adapter.updateInteractiveMessage(chatId, statusMsg.id, {
+      markdown: '**Creating new session...**'
+    })
     const res = await client.conn.newSession({ cwd, mcpServers: [] })
     client.sessionId = res.sessionId
     applySessionState(client, res)
     await this.cache.set(cacheKey(chatId, cwd), res.sessionId)
     logger.info({ chatId, sessionId: res.sessionId }, 'Created new session')
+    await this.adapter.updateInteractiveMessage(chatId, statusMsg.id, {
+      markdown: `**New session created** (${res.sessionId})`
+    })
     return client
   }
 
@@ -228,44 +380,66 @@ export class RouterCore {
   async onMessage(chatId: string, text: string) {
     logger.debug({ chatId }, 'Received user message')
     await this.adapter.setActive(chatId, true)
-    let client = this.clients.get(chatId)
-    if (!client) {
-      client = await this.startSession(chatId, this.defaults.agentId, { agentId: this.defaults.agentId }, this.defaults.cwd)
+    try {
+      let client = this.clients.get(chatId)
+      if (!client) {
+        client = await this.startSession(chatId, this.defaults.agentId, { agentId: this.defaults.agentId }, this.defaults.cwd)
+      }
+      await client.conn.prompt({ sessionId: client.sessionId, prompt: [{ type: 'text', text }] })
+      await client.flushTextBuffer()
+    } catch (err) {
+      logger.error({ chatId, err }, 'Error handling message')
+      await this.adapter.sendMarkdownText(chatId, `Error: ${err instanceof Error ? err.message : 'Unknown error'}`).catch(() => {})
+    } finally {
+      await this.adapter.setActive(chatId, false)
     }
-    await client.conn.prompt({ sessionId: client.sessionId, prompt: [{ type: 'text', text }] })
-    await this.adapter.setActive(chatId, false)
   }
 
   async onCommand(chatId: string, command: string, args: string[]) {
-    let client = this.clients.get(chatId)
-    if (!client) {
-      client = await this.startSession(chatId, this.defaults.agentId, { agentId: this.defaults.agentId }, this.defaults.cwd)
-    }
-    if (command === 'start') {
-      await this.adapter.sendMarkdownText(chatId, `Session ready (${client.sessionId})`)
-      return
-    }
-    const handlers: Record<string, () => Promise<void>> = {
-      agents: () => this.handleAgents(chatId),
-      sessions: () => this.handleSessions(chatId),
-      mode: () => this.handleMode(chatId, client, args[0]),
-      model: () => this.handleModel(chatId, client, args[0]),
-      config: () => this.handleConfig(chatId, client, args)
-    }
-    const handler = handlers[command]
-    if (handler) {
-      await handler()
-      return
-    }
-    if (command === 'cancel' && client.sessionId) {
-      await client.conn.cancel({ sessionId: client.sessionId })
-      await this.adapter.sendMarkdownText(chatId, 'Cancellation requested.')
-      return
-    }
-    const agentCommand = client.availableCommands.find((c) => c.name === command)
-    if (agentCommand && client.sessionId) {
-      await this.executeAgentCommand(client, command, args)
-      return
+    await this.adapter.setActive(chatId, true)
+    try {
+      let client = this.clients.get(chatId)
+      if (!client) {
+        client = await this.startSession(chatId, this.defaults.agentId, { agentId: this.defaults.agentId }, this.defaults.cwd)
+      }
+      if (command === 'start') {
+        await this.adapter.sendMarkdownText(chatId, `Session ready (${client.sessionId})`)
+        return
+      }
+      const handlers: Record<string, () => Promise<void>> = {
+        agents: () => this.handleAgents(chatId),
+        sessions: () => this.handleSessions(chatId),
+        mode: () => this.handleMode(chatId, client, args[0]),
+        model: () => this.handleModel(chatId, client, args[0]),
+        config: () => this.handleConfig(chatId, client, args)
+      }
+      const handler = handlers[command]
+      if (handler) {
+        await handler()
+        return
+      }
+      if (command === 'cancel') {
+        if (client.sessionId) {
+          await client.conn.cancel({ sessionId: client.sessionId })
+        }
+        await this.adapter.sendMarkdownText(chatId, 'Cancellation requested.')
+        return
+      }
+      const agentCommand = client.availableCommands.find((c) => c.name === command)
+      if (agentCommand && client.sessionId) {
+        await this.executeAgentCommand(client, command, args)
+        await client.flushTextBuffer()
+        return
+      }
+      // Unknown command: forward as plain text message
+      const fullText = `/${command}${args.length ? ' ' + args.join(' ') : ''}`
+      await client.conn.prompt({ sessionId: client.sessionId, prompt: [{ type: 'text', text: fullText }] })
+      await client.flushTextBuffer()
+    } catch (err) {
+      logger.error({ chatId, command, err }, 'Error handling command')
+      await this.adapter.sendMarkdownText(chatId, `Error: ${err instanceof Error ? err.message : 'Unknown error'}`).catch(() => {})
+    } finally {
+      await this.adapter.setActive(chatId, false)
     }
   }
 
@@ -279,7 +453,10 @@ export class RouterCore {
   }
 
   private async handleMode(chatId: string, client: RouterClient, target?: string) {
-    if (!client.sessionId || !client.modes) return
+    if (!client.sessionId || !client.modes) {
+      await this.adapter.sendMarkdownText(chatId, 'Modes are not available for this session.')
+      return
+    }
     if (!target) {
       await this.presentOptionPicker(chatId, {
         title: 'Session mode',
@@ -299,7 +476,10 @@ export class RouterCore {
   }
 
   private async handleModel(chatId: string, client: RouterClient, target?: string) {
-    if (!client.sessionId || !client.models) return
+    if (!client.sessionId || !client.models) {
+      await this.adapter.sendMarkdownText(chatId, 'Models are not available for this session.')
+      return
+    }
     if (!target) {
       await this.presentOptionPicker(chatId, {
         title: 'Session model',
@@ -319,7 +499,10 @@ export class RouterCore {
   }
 
   private async handleConfig(chatId: string, client: RouterClient, args: string[]) {
-    if (!client.sessionId || !client.configOptions.length) return
+    if (!client.sessionId || !client.configOptions.length) {
+      await this.adapter.sendMarkdownText(chatId, 'No config options available for this session.')
+      return
+    }
     const [optId, value] = args
     if (!optId) {
       const summary = client.configOptions.map((opt) => `${opt.id}=${opt.currentValue}`).join('\n')
@@ -351,12 +534,14 @@ export class RouterCore {
     }
   ) {
     const nonce = Date.now().toString(36)
-    const flow = params.title.replace(/\s+/g, '-').toLowerCase()
-    const actions = params.options.map((option) => ({
-      id: `acp:${flow}:${nonce}:select:${option.id}`,
-      label: option.label
-    }))
-    actions.push({ id: `acp:${flow}:${nonce}:cancel`, label: 'Cancel' })
+    const optionMap = new Map<string, string>()
+    const actions = params.options.map((option, i) => {
+      const key = `p:${nonce}:${i}`
+      optionMap.set(key, option.id)
+      return { id: key, label: option.label }
+    })
+    const cancelKey = `p:${nonce}:x`
+    actions.push({ id: cancelKey, label: 'Cancel' })
     let interactionId = ''
     const message: InlineMessage = {
       markdown: `**${params.title}**\nCurrent: ${params.current}`,
@@ -364,13 +549,22 @@ export class RouterCore {
         items: actions,
         callback: async (actionId: string) => {
           if (!interactionId) return
-          if (actionId === `acp:${flow}:${nonce}:cancel`) {
-            await this.adapter.updateInteractiveMessage(chatId, interactionId, { actions: null })
+          if (actionId === cancelKey) {
+            await this.adapter.updateInteractiveMessage(chatId, interactionId, { markdown: `**${params.title}**\nCancelled`, actions: null })
             return
           }
-          const selected = actionId.split(':')[4] ?? ''
-          const result = await params.apply(selected)
-          await this.adapter.updateInteractiveMessage(chatId, interactionId, { markdown: result, actions: null })
+          const selected = optionMap.get(actionId)
+          if (!selected) return
+          try {
+            const result = await params.apply(selected)
+            await this.adapter.updateInteractiveMessage(chatId, interactionId, { markdown: result, actions: null })
+          } catch (err) {
+            logger.error({ chatId, err }, 'Error applying option')
+            await this.adapter.updateInteractiveMessage(chatId, interactionId, {
+              markdown: `**${params.title}**\nError: ${err instanceof Error ? err.message : 'Unknown error'}`,
+              actions: null
+            })
+          }
         }
       }
     }
