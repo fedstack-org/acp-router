@@ -1,20 +1,10 @@
 import { Bot, InlineKeyboard, InputFile } from 'grammy'
-import { IMAdapter, logger, type AdapterInteraction, type InlineActions, type InlineMessage, type InlineUpdate } from '@acp-router/core'
-
-const BASE_COMMANDS = [
-  { name: 'start', description: 'Start a session' },
-  { name: 'cancel', description: 'Cancel current run' },
-  { name: 'sessions', description: 'List sessions' },
-  { name: 'agents', description: 'List agents' },
-  { name: 'mode', description: 'Get/set mode' },
-  { name: 'model', description: 'Get/set model' },
-  { name: 'config', description: 'Get/set config' }
-]
+import { IMAdapter, logger, type AdapterInteraction, type InlineActions, type InlineMessage, type InlineUpdate, type InteractiveMessageKind, type TextMessageKind } from '@acp-router/core'
+import { markdownToTelegramHtml } from './markdown.js'
 
 export class TelegramAdapter extends IMAdapter {
   readonly platform = 'telegram'
   private bot: Bot
-  private baseCommands = [...BASE_COMMANDS]
   private actionHandlers = new Map<string, (actionId: string) => Promise<void>>()
   private fallbackActions = new Map<string, (actionId: string) => Promise<void>>()
   private sendQueues = new Map<string, Promise<void>>()
@@ -34,9 +24,6 @@ export class TelegramAdapter extends IMAdapter {
 
   async init(): Promise<void> {
     logger.debug('Initializing Telegram adapter')
-    this.bot.api
-      .setMyCommands(this.baseCommands.map((cmd) => ({ command: cmd.name, description: cmd.description })))
-      .catch((err) => logger.warn({ err }, 'Failed to set initial bot commands'))
     this.bot.use(async (ctx, next) => {
       const chatId = ctx.chat?.id
       const chatType = ctx.chat?.type
@@ -60,10 +47,10 @@ export class TelegramAdapter extends IMAdapter {
         const command = parts[0]
         const args = parts.slice(1).filter(Boolean)
         logger.debug({ chatId, command, args }, 'Dispatching command')
-        await this.emit('command', chatId, command, args)
+        await this.emit('command', chatId, String(ctx.message.message_id), command, args)
       } else {
         logger.debug({ chatId, textLength: text.length }, 'Received text message')
-        await this.emit('text', chatId, text)
+        await this.emit('text', chatId, String(ctx.message.message_id), text)
       }
     })
     this.bot.on('callback_query:data', async (ctx) => {
@@ -83,12 +70,36 @@ export class TelegramAdapter extends IMAdapter {
     logger.debug('Telegram bot polling started')
   }
 
-  async sendMarkdownText(chatId: string, text: string): Promise<void> {
+  async sendTextMessage(chatId: string, text: string, kind: TextMessageKind = 'message'): Promise<void> {
     return this.enqueue(chatId, async () => {
-      logger.debug({ chatId, textLength: text.length }, 'Sending markdown text')
-      await this.bot.api.sendMessage(Number(chatId), text, { parse_mode: 'Markdown' }).catch((err) => {
-        logger.warn({ chatId, err }, 'Failed to send markdown text')
-      })
+      logger.debug({ chatId, textLength: text.length, kind }, 'Sending message')
+      if (kind === 'thought') {
+        try {
+          const innerHtml = markdownToTelegramHtml(text)
+          const html = `<blockquote expandable>\u{1F4AD} <b>Thinking</b>\n\n${innerHtml}</blockquote>`
+          await this.bot.api.sendMessage(Number(chatId), html, { parse_mode: 'HTML' })
+        } catch (err) {
+          logger.warn({ chatId, err }, 'Failed to send thought as expandable blockquote, falling back')
+          try {
+            const html = markdownToTelegramHtml(`> **Thinking**\n>\n> ${text.replace(/\n/g, '\n> ')}`)
+            await this.bot.api.sendMessage(Number(chatId), html, { parse_mode: 'HTML' })
+          } catch {
+            await this.bot.api.sendMessage(Number(chatId), `\u{1F4AD} Thinking\n\n${text}`).catch((err2) => {
+              logger.warn({ chatId, err: err2 }, 'Failed to send thought fallback')
+            })
+          }
+        }
+      } else {
+        try {
+          const html = markdownToTelegramHtml(text)
+          await this.bot.api.sendMessage(Number(chatId), html, { parse_mode: 'HTML' })
+        } catch (err) {
+          logger.warn({ chatId, err }, 'Failed to send as HTML, falling back to plain text')
+          await this.bot.api.sendMessage(Number(chatId), text).catch((err2) => {
+            logger.warn({ chatId, err: err2 }, 'Failed to send plain text fallback')
+          })
+        }
+      }
     })
   }
 
@@ -113,17 +124,22 @@ export class TelegramAdapter extends IMAdapter {
   }
 
   async setCommands(commands: { name: string; description: string }[]): Promise<void> {
-    const merged = [...this.baseCommands, ...commands]
-    await this.bot.api.setMyCommands(merged.map((cmd) => ({ command: cmd.name, description: cmd.description }))).catch(() => {})
-    logger.debug({ count: merged.length }, 'Telegram commands updated')
+    await this.bot.api.setMyCommands(commands.map((cmd) => ({ command: cmd.name, description: cmd.description }))).catch(() => {})
+    logger.debug({ count: commands.length }, 'Telegram commands updated')
   }
 
-  async sendInteractiveMessage(chatId: string, message: InlineMessage): Promise<AdapterInteraction> {
+  async sendInteractiveMessage(chatId: string, message: InlineMessage, kind: InteractiveMessageKind = 'generic'): Promise<AdapterInteraction> {
     return this.enqueue(chatId, async () => {
       logger.debug({ chatId, actionsCount: message.actions?.items.length ?? 0 }, 'Sending interactive message')
       const kb = message.actions ? toKeyboard(message.actions) : undefined
+      let html: string
+      try {
+        html = markdownToTelegramHtml(message.markdown)
+      } catch {
+        html = message.markdown
+      }
       const sent = await this.bot.api
-        .sendMessage(Number(chatId), message.markdown, { parse_mode: 'Markdown', reply_markup: kb })
+        .sendMessage(Number(chatId), html, { parse_mode: 'HTML', reply_markup: kb })
         .catch((err) => {
           logger.warn({ chatId, err }, 'Failed to send interactive message')
           return null
@@ -146,16 +162,22 @@ export class TelegramAdapter extends IMAdapter {
     })
   }
 
-  async updateInteractiveMessage(chatId: string, messageId: string, update: InlineUpdate): Promise<void> {
+  async editInteractiveMessage(chatId: string, messageId: string, update: InlineUpdate): Promise<void> {
     return this.enqueue(chatId, async () => {
       logger.debug({ chatId, messageId, hasMarkdown: update.markdown != null, hasActions: 'actions' in update }, 'Updating interactive message')
       const nextActions = 'actions' in update ? update.actions : undefined
       const removeKb = 'actions' in update && !update.actions
       const kb = nextActions ? toKeyboard(nextActions as InlineActions) : removeKb ? new InlineKeyboard() : undefined
       if (update.markdown != null) {
+        let html: string
+        try {
+          html = markdownToTelegramHtml(update.markdown)
+        } catch {
+          html = update.markdown
+        }
         await this.bot.api
-          .editMessageText(Number(chatId), Number(messageId), update.markdown, {
-            parse_mode: 'Markdown',
+          .editMessageText(Number(chatId), Number(messageId), html, {
+            parse_mode: 'HTML',
             reply_markup: kb
           })
           .catch((err) => {
@@ -192,6 +214,22 @@ export class TelegramAdapter extends IMAdapter {
     }
     sendTyping()
     this.typingTimers.set(chatId, setInterval(sendTyping, 5000))
+  }
+
+  async setReaction(chatId: string, messageId: string, kind: 'queued' | 'aborted' | 'ignored' | undefined): Promise<void> {
+    return this.enqueue(chatId, async () => {
+      logger.debug({ chatId, messageId, kind }, 'Setting reaction')
+      const reaction = kind === 'queued'
+        ? [{ type: 'emoji' as const, emoji: '✍' as const }]
+        : kind === 'aborted'
+          ? [{ type: 'emoji' as const, emoji: '🕊' as const }]
+          : kind === 'ignored'
+            ? [{ type: 'emoji' as const, emoji: '🤡' as const }]
+            : []
+      await this.bot.api.setMessageReaction(Number(chatId), Number(messageId), reaction).catch((err) => {
+        logger.warn({ chatId, messageId, kind, err }, 'Failed to set reaction')
+      })
+    })
   }
 
   private refreshActions(actions?: Partial<InlineActions> | null) {

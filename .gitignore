@@ -18,5 +18,5 @@ lib/
 .env
 .env.local
 
-# Bun (legacy)
-bun.lock
+# Log files
+*.log
