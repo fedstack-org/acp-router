@@ -1,18 +1,19 @@
 {
-  "name": "acp-router",
-  "version": "0.1.0",
+  "name": "@acp-router/monorepo",
+  "private": true,
   "type": "module",
-  "scripts": {
-    "dev": "bun --watch run src/index.ts",
-    "build": "bun build src/index.ts --outdir dist --target bun",
-    "typecheck": "tsc --noEmit"
+  "packageManager": "yarn@4.9.1+sha512.f95ce356460e05be48d66401c1ae64ef84d163dd689964962c6888a9810865e39097a5e9de748876c2e0bf89b232d583c33982773e9903ae7a76257270986538",
+  "workspaces": {
+    "packages": [
+      "packages/*"
+    ]
   },
-  "dependencies": {
-    "@agentclientprotocol/sdk": "^0.14.1",
-    "grammy": "^1.35.0"
+  "scripts": {
+    "build": "tsc -b tsconfig.json",
+    "typecheck": "tsc -b tsconfig.json"
   },
   "devDependencies": {
-    "@types/bun": "latest",
-    "typescript": "^5.7.0"
+    "@types/node": "^22",
+    "typescript": "^5.9.3"
   }
 }

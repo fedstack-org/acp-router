@@ -1,3 +1,22 @@
+# Dependencies
 node_modules/
+
+# Build output
 dist/
+lib/
+*.tsbuildinfo
+
+# Yarn
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+
+# Environment
+.env
+.env.local
+
+# Bun (legacy)
 bun.lock
