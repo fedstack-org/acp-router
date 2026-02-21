@@ -625,23 +625,23 @@ export class RouterCore {
       const caps = client.agentCapabilities?.promptCapabilities
       const blocks: ContentBlock[] = []
 
-      if (media.kind === 'image' && caps?.image) {
+      if ((media.kind === 'image' || media.kind === 'sticker') && caps?.image) {
         const data = await readFile(media.filePath)
         blocks.push({ type: 'image', data: data.toString('base64'), mimeType: media.mimeType })
       } else if ((media.kind === 'audio' || media.kind === 'voice') && caps?.audio) {
         const data = await readFile(media.filePath)
         blocks.push({ type: 'audio', data: data.toString('base64'), mimeType: media.mimeType })
       } else {
-        const meta = [
-          `Type: ${media.kind}`,
-          `MIME: ${media.mimeType}`,
-          `Path: ${media.filePath}`,
-          media.filename && `Filename: ${media.filename}`,
-          media.fileSize && `Size: ${media.fileSize} bytes`,
-          media.duration != null && `Duration: ${media.duration}s`,
-          media.width && media.height && `Dimensions: ${media.width}x${media.height}`,
-        ].filter(Boolean).join('\n')
-        blocks.push({ type: 'text', text: `[User sent a file]\n${meta}` })
+        const attrs = [
+          `type="${media.kind}"`,
+          `mime="${media.mimeType}"`,
+          `path="${media.filePath}"`,
+          media.filename && `filename="${media.filename}"`,
+          media.fileSize && `size="${media.fileSize}"`,
+          media.duration != null && `duration="${media.duration}"`,
+          media.width && media.height && `dimensions="${media.width}x${media.height}"`,
+        ].filter(Boolean).join(' ')
+        blocks.push({ type: 'text', text: `<attachment ${attrs} />` })
       }
 
       if (media.caption) {
@@ -737,7 +737,7 @@ export class RouterCore {
   }
 
   private async handleAgent(chatId: string, target?: string) {
-    const currentAgentId = this.chatAgents.get(chatId) ?? this.defaults.agentId
+    const currentAgentId = await this.resolveAgentId(chatId)
     if (!target) {
       await this.presentOptionPicker(chatId, {
         title: 'Agent',
@@ -754,7 +754,7 @@ export class RouterCore {
   private async switchAgent(chatId: string, agentId: string): Promise<string> {
     this.getAgentEntry(agentId)
 
-    const currentAgentId = this.chatAgents.get(chatId) ?? this.defaults.agentId
+    const currentAgentId = await this.resolveAgentId(chatId)
     if (agentId === currentAgentId) return `Agent: ${agentId} (no change)`
 
     const existing = this.clients.get(chatId)
