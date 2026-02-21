@@ -4,6 +4,8 @@ export type NormalizedContent =
   | { kind: 'text'; text: string }
   | { kind: 'image'; mimeType: string; data: Uint8Array }
   | { kind: 'audio'; mimeType: string; data: Uint8Array }
+  | { kind: 'video'; mimeType: string; data: Uint8Array }
+  | { kind: 'document'; mimeType: string; data: Uint8Array }
   | { kind: 'unknown'; type: string }
 
 export function normalizeContent(block: ContentBlock): NormalizedContent {
@@ -16,8 +18,18 @@ export function normalizeContent(block: ContentBlock): NormalizedContent {
       return { kind: 'audio', mimeType: block.mimeType, data: decodeBase64(block.data) }
     case 'resource_link':
       return { kind: 'unknown', type: 'resource_link' }
-    case 'resource':
+    case 'resource': {
+      const res = block.resource
+      if ('blob' in res && res.blob) {
+        const mime = res.mimeType ?? 'application/octet-stream'
+        const data = decodeBase64(res.blob)
+        if (mime.startsWith('image/')) return { kind: 'image', mimeType: mime, data }
+        if (mime.startsWith('audio/')) return { kind: 'audio', mimeType: mime, data }
+        if (mime.startsWith('video/')) return { kind: 'video', mimeType: mime, data }
+        return { kind: 'document', mimeType: mime, data }
+      }
       return { kind: 'unknown', type: 'resource' }
+    }
     default:
       return { kind: 'unknown', type: (block as { type: string }).type }
   }

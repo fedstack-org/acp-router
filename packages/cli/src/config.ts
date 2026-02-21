@@ -1,12 +1,8 @@
 import { readFile } from 'node:fs/promises'
-import { homedir } from 'node:os'
-import { join } from 'node:path'
-import { normalizeConfig, type RouterConfig } from '@acp-router/core'
-
-const CONFIG_PATH = join(homedir(), '.config', 'acp-router.json')
+import { normalizeConfig, paths, type RouterConfig } from '@acp-router/core'
 
 export async function loadConfig(): Promise<RouterConfig> {
-  const raw = await readFile(CONFIG_PATH, 'utf-8')
+  const raw = await readFile(paths.settings, 'utf-8')
   const parsed = JSON.parse(raw) as Record<string, unknown>
   return normalizeConfig({
     allowList: Array.isArray(parsed.allowList) ? (parsed.allowList as number[]) : [],

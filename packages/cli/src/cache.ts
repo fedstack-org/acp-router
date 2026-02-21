@@ -1,11 +1,9 @@
 import { readFile, mkdir, writeFile } from 'node:fs/promises'
-import { homedir } from 'node:os'
-import { join } from 'node:path'
-import type { SessionCacheStore } from '@acp-router/core'
+import { paths, type SessionCacheStore } from '@acp-router/core'
 
 export class FileSessionCache implements SessionCacheStore {
-  private path = join(homedir(), '.config', 'acp-router.cache.json')
-  private dir = join(homedir(), '.config')
+  private path = paths.mappings
+  private dir = paths.data
 
   async get(key: string): Promise<string | null> {
     try {

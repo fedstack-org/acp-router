@@ -1,5 +1,7 @@
-import { Bot, InlineKeyboard, InputFile } from 'grammy'
-import { IMAdapter, logger, type AdapterInteraction, type InlineActions, type InlineMessage, type InlineUpdate, type InteractiveMessageKind, type TextMessageKind } from '@acp-router/core'
+import { createReadStream } from 'node:fs'
+import { basename } from 'node:path'
+import { Bot, InlineKeyboard, InputFile, type Context } from 'grammy'
+import { IMAdapter, logger, writeMediaCacheFile, type AdapterInteraction, type AnnotationKind, type InlineActions, type InlineMessage, type InlineUpdate, type InteractiveMessageKind, type MediaPayload, type ReactionKind, type TextMessageKind } from '@acp-router/core'
 import { markdownToTelegramHtml } from './markdown.js'
 
 export class TelegramAdapter extends IMAdapter {
@@ -53,6 +55,130 @@ export class TelegramAdapter extends IMAdapter {
         await this.emit('text', chatId, String(ctx.message.message_id), text)
       }
     })
+    this.bot.on('message_reaction', async (ctx) => {
+      const reaction = ctx.messageReaction
+      const chatId = String(reaction.chat.id)
+      const messageId = String(reaction.message_id)
+      const emojiMap: Record<string, AnnotationKind> = { '😭': 'skip', '🙏': 'block' }
+      let kind: AnnotationKind | undefined
+      for (const r of reaction.new_reaction) {
+        if (r.type === 'emoji' && r.emoji in emojiMap) {
+          kind = emojiMap[r.emoji]
+          break
+        }
+      }
+      logger.debug({ chatId, messageId, kind }, 'Annotation update')
+      await this.emit('annotation', chatId, messageId, kind)
+    })
+    this.bot.on(':photo', async (ctx) => {
+      await this.handleIncomingMedia(ctx, () => {
+        const photo = ctx.message!.photo!
+        const largest = photo[photo.length - 1]
+        return {
+          kind: 'image',
+          fileId: largest.file_id,
+          mimeType: 'image/jpeg',
+          width: largest.width,
+          height: largest.height,
+          fileSize: largest.file_size,
+        }
+      })
+    })
+    this.bot.on(':video', async (ctx) => {
+      await this.handleIncomingMedia(ctx, () => {
+        const v = ctx.message!.video!
+        return {
+          kind: 'video',
+          fileId: v.file_id,
+          mimeType: v.mime_type ?? 'video/mp4',
+          filename: v.file_name,
+          duration: v.duration,
+          width: v.width,
+          height: v.height,
+          fileSize: v.file_size,
+        }
+      })
+    })
+    this.bot.on(':audio', async (ctx) => {
+      await this.handleIncomingMedia(ctx, () => {
+        const a = ctx.message!.audio!
+        return {
+          kind: 'audio',
+          fileId: a.file_id,
+          mimeType: a.mime_type ?? 'audio/mpeg',
+          filename: a.file_name,
+          duration: a.duration,
+          fileSize: a.file_size,
+        }
+      })
+    })
+    this.bot.on(':voice', async (ctx) => {
+      await this.handleIncomingMedia(ctx, () => {
+        const v = ctx.message!.voice!
+        return {
+          kind: 'voice',
+          fileId: v.file_id,
+          mimeType: v.mime_type ?? 'audio/ogg',
+          duration: v.duration,
+          fileSize: v.file_size,
+        }
+      })
+    })
+    this.bot.on(':document', async (ctx) => {
+      if (ctx.message!.animation) return
+      await this.handleIncomingMedia(ctx, () => {
+        const d = ctx.message!.document!
+        return {
+          kind: 'document',
+          fileId: d.file_id,
+          mimeType: d.mime_type ?? 'application/octet-stream',
+          filename: d.file_name,
+          fileSize: d.file_size,
+        }
+      })
+    })
+    this.bot.on(':animation', async (ctx) => {
+      await this.handleIncomingMedia(ctx, () => {
+        const a = ctx.message!.animation!
+        return {
+          kind: 'animation',
+          fileId: a.file_id,
+          mimeType: a.mime_type ?? 'video/mp4',
+          filename: a.file_name,
+          duration: a.duration,
+          width: a.width,
+          height: a.height,
+          fileSize: a.file_size,
+        }
+      })
+    })
+    this.bot.on(':video_note', async (ctx) => {
+      await this.handleIncomingMedia(ctx, () => {
+        const vn = ctx.message!.video_note!
+        return {
+          kind: 'video_note',
+          fileId: vn.file_id,
+          mimeType: 'video/mp4',
+          duration: vn.duration,
+          width: vn.length,
+          height: vn.length,
+          fileSize: vn.file_size,
+        }
+      })
+    })
+    this.bot.on(':sticker', async (ctx) => {
+      await this.handleIncomingMedia(ctx, () => {
+        const s = ctx.message!.sticker!
+        return {
+          kind: 'sticker',
+          fileId: s.file_id,
+          mimeType: s.is_video ? 'video/webm' : 'image/webp',
+          width: s.width,
+          height: s.height,
+          fileSize: s.file_size,
+        }
+      })
+    })
     this.bot.on('callback_query:data', async (ctx) => {
       const data = ctx.callbackQuery?.data
       if (!data) return
@@ -66,7 +192,9 @@ export class TelegramAdapter extends IMAdapter {
       await ctx.answerCallbackQuery().catch(() => {})
     })
     this.bot.catch((err) => logger.error({ err }, 'Telegram adapter error'))
-    this.bot.start()
+    this.bot.start({
+      allowed_updates: ['message', 'callback_query', 'message_reaction']
+    })
     logger.debug('Telegram bot polling started')
   }
 
@@ -103,10 +231,10 @@ export class TelegramAdapter extends IMAdapter {
     })
   }
 
-  async sendMedia(chatId: string, payload: { kind: string; mimeType: string; data: Uint8Array; filename?: string }): Promise<void> {
+  async sendMedia(chatId: string, payload: { kind: string; mimeType: string; filePath: string }): Promise<void> {
     return this.enqueue(chatId, async () => {
-      logger.debug({ chatId, kind: payload.kind, mimeType: payload.mimeType, size: payload.data.length }, 'Sending media')
-      const file = new InputFile(Buffer.from(payload.data), payload.filename ?? `file.${extFromMime(payload.mimeType)}`)
+      logger.debug({ chatId, kind: payload.kind, mimeType: payload.mimeType, filePath: payload.filePath }, 'Sending media')
+      const file = new InputFile(createReadStream(payload.filePath), basename(payload.filePath))
       if (payload.kind === 'image') {
         await this.bot.api.sendPhoto(Number(chatId), file).catch((err) => logger.warn({ chatId, err }, 'Failed to send photo'))
         return
@@ -216,20 +344,77 @@ export class TelegramAdapter extends IMAdapter {
     this.typingTimers.set(chatId, setInterval(sendTyping, 5000))
   }
 
-  async setReaction(chatId: string, messageId: string, kind: 'queued' | 'aborted' | 'ignored' | undefined): Promise<void> {
+  async setReaction(chatId: string, messageId: string, kind: ReactionKind | undefined): Promise<void> {
     return this.enqueue(chatId, async () => {
       logger.debug({ chatId, messageId, kind }, 'Setting reaction')
-      const reaction = kind === 'queued'
-        ? [{ type: 'emoji' as const, emoji: '✍' as const }]
-        : kind === 'aborted'
-          ? [{ type: 'emoji' as const, emoji: '🕊' as const }]
-          : kind === 'ignored'
-            ? [{ type: 'emoji' as const, emoji: '🤡' as const }]
-            : []
+      const emojiMap: Record<string, string> = {
+        queued: '✍',
+        pending: '👀',
+        aborted: '🕊',
+        ignored: '🤡'
+      }
+      const reaction = kind && emojiMap[kind]
+        ? [{ type: 'emoji' as const, emoji: emojiMap[kind] as any }]
+        : []
       await this.bot.api.setMessageReaction(Number(chatId), Number(messageId), reaction).catch((err) => {
         logger.warn({ chatId, messageId, kind, err }, 'Failed to set reaction')
       })
     })
+  }
+
+  private async handleIncomingMedia(
+    ctx: Context,
+    extract: () => {
+      kind: MediaPayload['kind']
+      fileId: string
+      mimeType: string
+      filename?: string
+      duration?: number
+      width?: number
+      height?: number
+      fileSize?: number
+    }
+  ): Promise<void> {
+    const chatId = String(ctx.chat!.id)
+    const messageId = String(ctx.message!.message_id)
+    const caption = ctx.message?.caption
+    let info: ReturnType<typeof extract>
+    try {
+      info = extract()
+    } catch (err) {
+      logger.warn({ chatId, err }, 'Failed to extract media info')
+      return
+    }
+    logger.debug({ chatId, kind: info.kind, mimeType: info.mimeType }, 'Received media message')
+    try {
+      const file = await ctx.api.getFile(info.fileId)
+      if (!file.file_path) {
+        logger.warn({ chatId, fileId: info.fileId }, 'No file_path returned from getFile')
+        return
+      }
+      const url = `https://api.telegram.org/file/bot${this.token}/${file.file_path}`
+      const res = await fetch(url)
+      if (!res.ok) {
+        logger.warn({ chatId, status: res.status }, 'Failed to download file from Telegram')
+        return
+      }
+      const data = new Uint8Array(await res.arrayBuffer())
+      const filePath = await writeMediaCacheFile(chatId, info.mimeType, data)
+      const payload: MediaPayload = {
+        kind: info.kind,
+        mimeType: info.mimeType,
+        filePath,
+        filename: info.filename,
+        caption,
+        duration: info.duration,
+        width: info.width,
+        height: info.height,
+        fileSize: info.fileSize ?? data.length,
+      }
+      await this.emit('media', chatId, messageId, payload)
+    } catch (err) {
+      logger.error({ chatId, kind: info.kind, err }, 'Failed to handle incoming media')
+    }
   }
 
   private refreshActions(actions?: Partial<InlineActions> | null) {
@@ -255,11 +440,6 @@ export class TelegramAdapter extends IMAdapter {
       }
     }
   }
-}
-
-function extFromMime(mime: string): string {
-  const idx = mime.indexOf('/')
-  return idx === -1 ? 'bin' : mime.slice(idx + 1)
 }
 
 function toKeyboard(actions: { columns?: number; items: { id: string; label: string }[] }) {

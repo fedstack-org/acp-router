@@ -14,9 +14,11 @@ import type {
   SessionModeState,
   SessionModelState
 } from './types.js'
+import { readFile } from 'node:fs/promises'
 import { normalizeContent } from './content.js'
+import { writeMediaCacheFile } from './media.js'
 import { CLIENT_INFO } from './constants.js'
-import { IMAdapter, type InlineMessage } from './im-adapter.js'
+import { IMAdapter, type InlineMessage, type MediaPayload } from './im-adapter.js'
 import { logger } from './logger.js'
 
 export interface RouterSessionState {
@@ -30,6 +32,7 @@ export interface RouterSessionState {
 
 export interface RouterClientState {
   agentInfo: acp.Implementation | null
+  agentCapabilities: acp.AgentCapabilities | null
   session: RouterSessionState | null
 }
 
@@ -51,6 +54,7 @@ export class RouterClient implements acp.Client {
   conn!: acp.ClientSideConnection
   sessionId = ''
   agentInfo: acp.Implementation | null = null
+  agentCapabilities: acp.AgentCapabilities | null = null
   title = ''
   configOptions: SessionConfigOption[] = []
   availableCommands: AvailableCommand[] = []
@@ -75,6 +79,7 @@ export class RouterClient implements acp.Client {
   get state(): RouterClientState {
     return {
       agentInfo: this.agentInfo,
+      agentCapabilities: this.agentCapabilities,
       session: this.sessionId
         ? {
             sessionId: this.sessionId,
@@ -275,7 +280,8 @@ export class RouterClient implements acp.Client {
     }
     await this.flushTextBuffer()
     if (normalized.kind === 'unknown') return this.adapter.sendTextMessage(this.chatId, `[Content: ${normalized.type}]`)
-    return this.adapter.sendMedia(this.chatId, normalized)
+    const filePath = await writeMediaCacheFile(this.chatId, normalized.mimeType, normalized.data)
+    return this.adapter.sendMedia(this.chatId, { kind: normalized.kind, mimeType: normalized.mimeType, filePath })
   }
 
   private async presentToolApproval(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
@@ -340,10 +346,12 @@ export class RouterCore {
   ) {}
 
   private messageQueues = new Map<string, Promise<void>>()
-  private pendingMessages = new Map<string, { messageId: string; aborted: boolean }[]>()
+  private pendingMessages = new Map<string, { messageId: string; aborted: boolean; blocked: boolean; resolve?: () => void }[]>()
 
   private enqueueMessage(chatId: string, messageId: string, fn: () => Promise<void>): Promise<void> {
-    const entry = { messageId, aborted: false }
+    const entry: { messageId: string; aborted: boolean; blocked: boolean; resolve?: () => void } = {
+      messageId, aborted: false, blocked: false
+    }
     const pending = this.pendingMessages.get(chatId) ?? []
     pending.push(entry)
     this.pendingMessages.set(chatId, pending)
@@ -352,16 +360,35 @@ export class RouterCore {
       logger.warn({ chatId, messageId, err }, 'Failed to set queued reaction')
     })
 
-    const prev = this.messageQueues.get(chatId) ?? Promise.resolve()
-    const wrapped = async () => {
+    const spliceEntry = () => {
       const entries = this.pendingMessages.get(chatId)
       if (entries) {
         const idx = entries.indexOf(entry)
         if (idx !== -1) entries.splice(idx, 1)
       }
-      if (entry.aborted) {
-        return
+    }
+
+    const prev = this.messageQueues.get(chatId) ?? Promise.resolve()
+    const wrapped = async () => {
+      if (entry.aborted) { spliceEntry(); return }
+
+      await this.adapter.setReaction(chatId, messageId, 'pending').catch((err) => {
+        logger.warn({ chatId, messageId, err }, 'Failed to set pending reaction')
+      })
+
+      // Grace period: wait 1s, can be resolved early by annotation
+      await new Promise<void>((r) => { entry.resolve = r; setTimeout(r, 1000) })
+      entry.resolve = undefined
+      if (entry.aborted) { spliceEntry(); return }
+
+      // Block loop: wait while blocked
+      while (entry.blocked && !entry.aborted) {
+        await new Promise<void>((r) => { entry.resolve = r })
+        entry.resolve = undefined
       }
+      if (entry.aborted) { spliceEntry(); return }
+
+      spliceEntry()
       await this.adapter.setReaction(chatId, messageId, undefined).catch((err) => {
         logger.warn({ chatId, messageId, err }, 'Failed to clear reaction')
       })
@@ -377,6 +404,7 @@ export class RouterCore {
     if (!pending) return
     for (const entry of pending) {
       entry.aborted = true
+      entry.resolve?.()
       this.adapter.setReaction(chatId, entry.messageId, 'aborted').catch((err) => {
         logger.warn({ chatId, messageId: entry.messageId, err }, 'Failed to set aborted reaction on drain')
       })
@@ -388,8 +416,30 @@ export class RouterCore {
     await this.adapter.init()
     logger.info({ platform: this.adapter.platform }, 'IM adapter initialized')
     await this.adapter.setCommands(BUILT_IN_COMMANDS)
+    this.adapter.on('annotation', (chatId, messageId, kind) => {
+      const pending = this.pendingMessages.get(chatId)
+      const entry = pending?.find((e) => e.messageId === messageId)
+      if (!entry) return
+      logger.debug({ chatId, messageId, kind }, 'Annotation received for pending message')
+      if (kind === 'skip') {
+        entry.aborted = true
+        entry.blocked = false
+        entry.resolve?.()
+        this.adapter.setReaction(chatId, messageId, 'aborted').catch((err) => {
+          logger.warn({ chatId, messageId, err }, 'Failed to set aborted reaction on skip')
+        })
+      } else if (kind === 'block') {
+        entry.blocked = true
+      } else {
+        entry.blocked = false
+        entry.resolve?.()
+      }
+    })
     this.adapter.on('text', (chatId, messageId, text) => {
       this.enqueueMessage(chatId, messageId, () => this.onMessage(chatId, text))
+    })
+    this.adapter.on('media', (chatId, messageId, media) => {
+      this.enqueueMessage(chatId, messageId, () => this.onMedia(chatId, media))
     })
     this.adapter.on('command', (chatId, messageId, command, args) => {
       if (command === 'cancel' || command === 'clear') {
@@ -452,7 +502,9 @@ export class RouterCore {
       clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false }
     })
     client.agentInfo = init.agentInfo ?? null
+    client.agentCapabilities = init.agentCapabilities ?? null
     logger.info({ chatId, agentId, sessionId: client.sessionId }, 'Client initialized')
+    await this.adapter.sendTextMessage(chatId, formatAgentInfo(entry, client.agentInfo, client.agentCapabilities))
     this.clients.set(chatId, client)
     this.clientProcs.set(chatId, proc)
     proc.stderr
@@ -559,6 +611,47 @@ export class RouterCore {
       await client.flushTextBuffer()
     } catch (err) {
       logger.error({ chatId, err }, 'Error handling message')
+      await this.adapter.sendTextMessage(chatId, `Error: ${err instanceof Error ? err.message : 'Unknown error'}`).catch(() => {})
+    } finally {
+      await this.adapter.setActive(chatId, false)
+    }
+  }
+
+  async onMedia(chatId: string, media: MediaPayload) {
+    logger.debug({ chatId, kind: media.kind, mimeType: media.mimeType }, 'Received user media')
+    await this.adapter.setActive(chatId, true)
+    try {
+      const client = await this.ensureSession(chatId)
+      const caps = client.agentCapabilities?.promptCapabilities
+      const blocks: ContentBlock[] = []
+
+      if (media.kind === 'image' && caps?.image) {
+        const data = await readFile(media.filePath)
+        blocks.push({ type: 'image', data: data.toString('base64'), mimeType: media.mimeType })
+      } else if ((media.kind === 'audio' || media.kind === 'voice') && caps?.audio) {
+        const data = await readFile(media.filePath)
+        blocks.push({ type: 'audio', data: data.toString('base64'), mimeType: media.mimeType })
+      } else {
+        const meta = [
+          `Type: ${media.kind}`,
+          `MIME: ${media.mimeType}`,
+          `Path: ${media.filePath}`,
+          media.filename && `Filename: ${media.filename}`,
+          media.fileSize && `Size: ${media.fileSize} bytes`,
+          media.duration != null && `Duration: ${media.duration}s`,
+          media.width && media.height && `Dimensions: ${media.width}x${media.height}`,
+        ].filter(Boolean).join('\n')
+        blocks.push({ type: 'text', text: `[User sent a file]\n${meta}` })
+      }
+
+      if (media.caption) {
+        blocks.unshift({ type: 'text', text: media.caption })
+      }
+
+      await client.conn.prompt({ sessionId: client.sessionId, prompt: blocks })
+      await client.flushTextBuffer()
+    } catch (err) {
+      logger.error({ chatId, err }, 'Error handling media')
       await this.adapter.sendTextMessage(chatId, `Error: ${err instanceof Error ? err.message : 'Unknown error'}`).catch(() => {})
     } finally {
       await this.adapter.setActive(chatId, false)
@@ -842,6 +935,37 @@ function formatSessionInfo(client: RouterClient): string {
     }
   }
   return lines.length ? '\n' + lines.join('\n') : ''
+}
+
+function formatAgentInfo(
+  entry: AgentRegistryEntry,
+  agentInfo: acp.Implementation | null,
+  caps: acp.AgentCapabilities | null
+): string {
+  const name = agentInfo?.title ?? agentInfo?.name ?? entry.name
+  const version = agentInfo?.version ? ` (v${agentInfo.version})` : ''
+  const lines: string[] = [`**Agent connected:** ${name}${version}`]
+  if (entry.description) lines.push(entry.description)
+
+  const features: string[] = []
+  if (caps?.promptCapabilities) {
+    const p = caps.promptCapabilities
+    if (p.image) features.push('image')
+    if (p.audio) features.push('audio')
+    if (p.embeddedContext) features.push('embedded context')
+  }
+  const session: string[] = []
+  if (caps?.sessionCapabilities?.resume) session.push('resume')
+  if (caps?.sessionCapabilities?.fork) session.push('fork')
+  if (caps?.sessionCapabilities?.list) session.push('list')
+  if (caps?.loadSession) session.push('load')
+
+  const parts: string[] = []
+  if (features.length) parts.push(features.join(', '))
+  if (session.length) parts.push(`Session: ${session.join(', ')}`)
+  if (parts.length) lines.push(`Supports: ${parts.join(' | ')}`)
+
+  return lines.join('\n')
 }
 
 function cacheKey(chatId: string, agentId: string, cwd: string) {
